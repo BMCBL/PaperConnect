@@ -1,6 +1,6 @@
 [package]
 name = "paperconnect"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0"
 publish = false
@@ -32,18 +32,30 @@ bmcbl_plugin_api = { path = "sdk/bmcbl-plugin-api", features = ["pack"] }
 id = "paperconnect"
 name = "PaperConnect"
 description = "Bedrock multiplayer and local UDP diagnostics"
-capabilities = ["ui.page", "clipboard.read", "clipboard.write", "config.read", "config.write", "event.global", "download.start"]
+capabilities = ["ui.page", "clipboard.read", "clipboard.write", "config.read", "config.write", "event.global", "network.http", "download.start"]
 readme = "README.md"
 config_default = "config/default.toml"
 config_schema = "config/schema.toml"
 
 [package.metadata.bmcbl-plugin.permissions.network]
 allow = [
-    "https://api.github.com/repos/BMCBL/PaperConnect/releases/latest",
-    "https://github.com/BMCBL/PaperConnect/releases/download/",
+    "https://github.com/BMCBL/PaperConnect/releases/",
+    "https://release-assets.githubusercontent.com/",
+    "https://objects.githubusercontent.com/",
 ]
 
 [patch.crates-io]
 dtls = { path = "vendor/dtls" }
 webrtc = { path = "vendor/webrtc" }
 webrtc-ice = { path = "vendor/webrtc-ice" }
+
+[profile.native-release]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Preserve the catch_unwind boundary in the in-process C ABI.
+panic = "unwind"
+strip = "symbols"
+incremental = false
+debug = 0

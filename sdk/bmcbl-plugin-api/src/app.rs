@@ -15,6 +15,11 @@ pub fn read_download_text(task_id: &str) -> PluginResult<Job<String>> {
     invoke("download.read-text", &(task_id,))
 }
 
+/// Fetches small text directly from an allowed HTTPS source, including allowed redirects.
+pub fn fetch_download_text(url: &str) -> PluginResult<Job<String>> {
+    invoke("download.fetch-text", &(url,))
+}
+
 impl<T: DeserializeOwned> Job<T> {
     /// Returns whether BMCBL delivered the completion event for this job.
     pub fn is_ready(&self, event: &crate::PluginEvent) -> bool {

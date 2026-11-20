@@ -50,9 +50,9 @@ jobs:
         run: |
           rustup target add $env:NATIVE_TARGET
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo build --locked --release --target $env:NATIVE_TARGET -p paperconnect-native
+          cargo build --locked --profile native-release --target $env:NATIVE_TARGET -p paperconnect-native
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $file = Join-Path 'target' "$env:NATIVE_TARGET/release/$env:NATIVE_LIBRARY"
+          $file = Join-Path 'target' "$env:NATIVE_TARGET/native-release/$env:NATIVE_LIBRARY"
           New-Item -ItemType Directory -Path 'artifacts' | Out-Null
           $asset = Join-Path 'artifacts' $env:NATIVE_ASSET
           Copy-Item -LiteralPath $file -Destination $asset
@@ -111,4 +111,18 @@ jobs:
             options=(--target "$GITHUB_SHA")
           fi
           (cd artifacts && sha256sum --check --strict *.sha256)
+          python3 - "$tag" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          directory = Path('artifacts')
+          assets = []
+          for checksum in sorted(directory.glob('paperconnect-native-*.sha256')):
+              digest, name = checksum.read_text(encoding='ascii').split()
+              assets.append({'name': name, 'digest': f'sha256:{digest}'})
+          assert len(assets) == 4, 'all native targets must provide a digest'
+          index = {'tag_name': sys.argv[1], 'assets': assets}
+          (directory / 'paperconnect-native.json').write_text(json.dumps(index, indent=2) + '\n', encoding='utf-8')
+          PY
           gh release create "$tag" artifacts/* --repo "$GITHUB_REPOSITORY" "${options[@]}" --generate-notes --latest

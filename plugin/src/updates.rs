@@ -1,4 +1,4 @@
-use bmcbl_plugin_api::app::{Job, read_download_text};
+use bmcbl_plugin_api::app::{Job, fetch_download_text};
 use bmcbl_plugin_api::native::{self, Platform};
 use bmcbl_plugin_api::prelude::*;
 use semver::Version;
@@ -6,7 +6,8 @@ use serde::Deserialize;
 
 use super::{Connection, PageState, ready};
 
-const RELEASE_API: &str = "https://api.github.com/repos/BMCBL/PaperConnect/releases/latest";
+const RELEASE_INDEX: &str =
+    "https://github.com/BMCBL/PaperConnect/releases/latest/download/paperconnect-native.json";
 const RELEASE_DOWNLOAD: &str = "https://github.com/BMCBL/PaperConnect/releases/download";
 
 #[derive(Default)]
@@ -80,13 +81,7 @@ impl PageState {
         match std::mem::take(&mut self.update) {
             Update::Platform { install, job } if job.is_ready(event) => {
                 let platform = ready(job)?;
-                let task = download_resource(DownloadRequest {
-                    url: RELEASE_API.into(),
-                    file_name: "paperconnect-latest-release.json".into(),
-                    md5: None,
-                    force_download: true,
-                })?;
-                let job = read_download_text(&task)?;
+                let job = fetch_download_text(RELEASE_INDEX)?;
                 self.update = Update::Release {
                     install,
                     platform,
