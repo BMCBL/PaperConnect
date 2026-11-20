@@ -1,6 +1,6 @@
 [package]
 name = "paperconnect"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "GPL-3.0"
 publish = false
@@ -34,11 +34,14 @@ name = "PaperConnect"
 description = "Bedrock multiplayer and local UDP diagnostics"
 capabilities = ["ui.page", "clipboard.read", "clipboard.write", "config.read", "config.write", "event.global", "network.http", "download.start"]
 readme = "README.md"
+icon = "assets/icon.png"
 config_default = "config/default.toml"
 config_schema = "config/schema.toml"
 
 [package.metadata.bmcbl-plugin.permissions.network]
 allow = [
+    "https://bmcbl-plugin.chlna6666.com/v1/plugins/paperconnect.json",
+    "https://bmcbl-plugin.chlna6666.com/downloads/official/paperconnect/",
     "https://github.com/BMCBL/PaperConnect/releases/",
     "https://release-assets.githubusercontent.com/",
     "https://objects.githubusercontent.com/",

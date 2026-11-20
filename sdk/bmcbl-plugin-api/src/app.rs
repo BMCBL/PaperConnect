@@ -20,6 +20,20 @@ pub fn fetch_download_text(url: &str) -> PluginResult<Job<String>> {
     invoke("download.fetch-text", &(url,))
 }
 
+/// Sources in priority order, all serving the same bytes.
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+pub struct VerifiedDownload {
+    pub urls: Vec<String>,
+    pub filename: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// Starts a BMCBL transfer which checks each source and returns its task ID.
+pub fn download_verified(request: &VerifiedDownload) -> PluginResult<Job<String>> {
+    invoke("download.verified", request)
+}
+
 impl<T: DeserializeOwned> Job<T> {
     /// Returns whether BMCBL delivered the completion event for this job.
     pub fn is_ready(&self, event: &crate::PluginEvent) -> bool {

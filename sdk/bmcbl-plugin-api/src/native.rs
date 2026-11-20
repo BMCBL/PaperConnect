@@ -32,8 +32,9 @@ pub fn stage_download(task_id: &str, sha256: &str) -> PluginResult<Job<()>> {
     invoke("native.stage-download", &(task_id, sha256))
 }
 
-/// Verifies and stages a download, then asks the user to approve the exact binary.
-pub fn install_download(task_id: &str, sha256: &str) -> PluginResult<Job<()>> {
+/// Waits for a download started by this plugin, verifies its SHA-256, and asks
+/// the user to approve the staged binary.
+pub fn download(task_id: &str, sha256: &str) -> PluginResult<Job<()>> {
     invoke("native.install-download", &(task_id, sha256))
 }
 

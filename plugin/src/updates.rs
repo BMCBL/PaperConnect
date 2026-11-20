@@ -1,4 +1,4 @@
-use bmcbl_plugin_api::app::{Job, fetch_download_text};
+use bmcbl_plugin_api::app::{Job, VerifiedDownload, download_verified, fetch_download_text};
 use bmcbl_plugin_api::native::{self, Platform};
 use bmcbl_plugin_api::prelude::*;
 use semver::Version;
@@ -9,6 +9,8 @@ use super::{Connection, PageState, ready};
 const RELEASE_INDEX: &str =
     "https://github.com/BMCBL/PaperConnect/releases/latest/download/paperconnect-native.json";
 const RELEASE_DOWNLOAD: &str = "https://github.com/BMCBL/PaperConnect/releases/download";
+const REGISTRY_ORIGIN: &str = "https://bmcbl-plugin.chlna6666.com";
+const REGISTRY_DETAIL: &str = "https://bmcbl-plugin.chlna6666.com/v1/plugins/paperconnect.json";
 
 #[derive(Default)]
 pub(super) enum Update {
@@ -21,9 +23,14 @@ pub(super) enum Update {
     Release {
         install: bool,
         platform: Platform,
+        registry: bool,
         job: Job<String>,
     },
     Available(Component),
+    Starting {
+        component: Component,
+        job: Job<String>,
+    },
     Installing {
         component: Component,
         job: Job<()>,
@@ -34,6 +41,7 @@ pub(super) struct Component {
     version: Version,
     url: String,
     sha256: String,
+    verified: Option<VerifiedDownload>,
 }
 
 impl Component {
@@ -52,6 +60,41 @@ struct Release {
 struct Asset {
     name: String,
     digest: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RegistryRelease {
+    schema_version: u32,
+    id: String,
+    repository: String,
+    status: String,
+    version: String,
+    native_assets: Vec<RegistryAsset>,
+}
+
+#[derive(Deserialize)]
+struct RegistryAsset {
+    abi_major: u32,
+    os: String,
+    arch: String,
+    environment: String,
+    filename: String,
+    size: u64,
+    sha256: String,
+    sources: Vec<RegistrySource>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum RegistrySource {
+    Edgeone {
+        path: String,
+    },
+    Github {
+        url: String,
+    },
+    #[serde(other)]
+    Other,
 }
 
 impl PageState {
@@ -81,19 +124,44 @@ impl PageState {
         match std::mem::take(&mut self.update) {
             Update::Platform { install, job } if job.is_ready(event) => {
                 let platform = ready(job)?;
-                let job = fetch_download_text(RELEASE_INDEX)?;
+                let (registry, job) = match fetch_download_text(REGISTRY_DETAIL) {
+                    Ok(job) => (true, job),
+                    Err(_) => (false, fetch_download_text(RELEASE_INDEX)?),
+                };
                 self.update = Update::Release {
                     install,
                     platform,
+                    registry,
                     job,
                 };
             }
             Update::Release {
                 install,
                 platform,
+                registry,
                 job,
             } if job.is_ready(event) => {
-                let component = component_for_platform(&ready(job)?, &platform)?;
+                let component = if registry {
+                    match ready(job).and_then(|text| registry_component(&text, &platform)) {
+                        Ok(component)
+                            if Version::parse(env!("CARGO_PKG_VERSION"))
+                                .is_ok_and(|package| component.version >= package) =>
+                        {
+                            component
+                        }
+                        _ => {
+                            self.update = Update::Release {
+                                install,
+                                platform,
+                                registry: false,
+                                job: fetch_download_text(RELEASE_INDEX)?,
+                            };
+                            return Ok(true);
+                        }
+                    }
+                } else {
+                    component_for_platform(&ready(job)?, &platform)?
+                };
                 let installed_version = self
                     .config
                     .native_version
@@ -109,6 +177,10 @@ impl PageState {
                     self.message.clear();
                     self.update = Update::Available(component);
                 }
+            }
+            Update::Starting { component, job } if job.is_ready(event) => {
+                let task_id = ready(job)?;
+                self.await_install(component, &task_id)?;
             }
             Update::Installing { component, job } if job.is_ready(event) => {
                 ready(job)?;
@@ -130,19 +202,34 @@ impl PageState {
     }
 
     fn download_component(&mut self, component: Component) -> PluginResult<()> {
-        let task = download_resource(DownloadRequest {
+        if let Some(request) = &component.verified
+            && let Ok(job) = download_verified(request)
+        {
+            self.download_message(&component);
+            self.update = Update::Starting { component, job };
+            return Ok(());
+        }
+        let task_id = download_resource(DownloadRequest {
             url: component.url.clone(),
             file_name: format!("paperconnect-native-{}.bin", component.sha256),
             md5: None,
             force_download: true,
         })?;
-        let job = native::install_download(&task, &component.sha256)?;
+        self.await_install(component, &task_id)
+    }
+
+    fn await_install(&mut self, component: Component, task_id: &str) -> PluginResult<()> {
+        let job = native::download(task_id, &component.sha256)?;
+        self.download_message(&component);
+        self.update = Update::Installing { component, job };
+        Ok(())
+    }
+
+    fn download_message(&mut self, component: &Component) {
         self.message = format!(
             "正在下载原生组件 {}，校验完成后将请求授权。",
             component.version
         );
-        self.update = Update::Installing { component, job };
-        Ok(())
     }
 }
 
@@ -191,12 +278,7 @@ fn component_for_platform(text: &str, platform: &Platform) -> PluginResult<Compo
         .find(|asset| asset.name == name)
         .and_then(|asset| asset.digest)
         .and_then(|digest| digest.strip_prefix("sha256:").map(str::to_owned))
-        .filter(|sha| {
-            sha.len() == 64
-                && sha
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
-        })
+        .filter(|sha| valid_digest(sha))
         .ok_or_else(|| {
             plugin_error(
                 "native-asset",
@@ -208,7 +290,86 @@ fn component_for_platform(text: &str, platform: &Platform) -> PluginResult<Compo
         version,
         url,
         sha256,
+        verified: None,
     })
+}
+
+fn registry_component(text: &str, platform: &Platform) -> PluginResult<Component> {
+    let invalid = || plugin_error("native-release", "插件目录中的原生组件信息无效。");
+    let release: RegistryRelease = serde_json::from_str(text).map_err(|_| invalid())?;
+    if release.schema_version != 1
+        || release.id != "paperconnect"
+        || release.repository != "BMCBL/PaperConnect"
+        || release.status != "official"
+    {
+        return Err(invalid());
+    }
+    let version = Version::parse(&release.version)
+        .ok()
+        .filter(|version| version.pre.is_empty() && version.build.is_empty())
+        .ok_or_else(invalid)?;
+    let extension = match (platform.os.as_str(), platform.environment.as_str()) {
+        ("windows", "msvc") => "dll",
+        ("linux", "gnu") => "so",
+        _ => return Err(invalid()),
+    };
+    let filename = format!(
+        "paperconnect-native-abi{}-{}-{}-{}.{extension}",
+        native::abi::MAJOR,
+        platform.os,
+        platform.arch,
+        platform.environment
+    );
+    let asset = release
+        .native_assets
+        .into_iter()
+        .find(|asset| {
+            asset.abi_major == native::abi::MAJOR
+                && asset.os == platform.os
+                && asset.arch == platform.arch
+                && asset.environment == platform.environment
+                && asset.filename == filename
+                && valid_digest(&asset.sha256)
+                && (1..=256 * 1024 * 1024).contains(&asset.size)
+        })
+        .ok_or_else(invalid)?;
+    let url = format!("{RELEASE_DOWNLOAD}/v{version}/{filename}");
+    let path = format!(
+        "/downloads/official/paperconnect/{}.{extension}",
+        asset.sha256
+    );
+    let mut urls = Vec::new();
+    for source in asset.sources {
+        match source {
+            RegistrySource::Edgeone { path: source } if source == path => {
+                urls.push(format!("{REGISTRY_ORIGIN}{path}"));
+            }
+            RegistrySource::Github { url: source } if source == url => urls.push(source),
+            _ => {}
+        }
+    }
+    if !urls.contains(&url) {
+        return Err(invalid());
+    }
+    let verified = Some(VerifiedDownload {
+        urls,
+        filename,
+        sha256: asset.sha256.clone(),
+        size: asset.size,
+    });
+    Ok(Component {
+        version,
+        url,
+        sha256: asset.sha256,
+        verified,
+    })
+}
+
+fn valid_digest(sha: &str) -> bool {
+    sha.len() == 64
+        && sha
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn save_component(component: &Component) -> PluginResult<()> {

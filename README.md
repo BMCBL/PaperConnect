@@ -11,7 +11,7 @@ $env:BMCBL_PLUGIN_PACKAGE_OUT_DIR = Join-Path $PWD 'dist'
 cargo build --locked -p paperconnect --target wasm32-wasip2
 ```
 
-优化后的 DLL 位于 `target/native-release/paperconnect_native.dll`。在新版 BMCBL 中导入 `dist/paperconnect-0.1.2.bmcblx`。从插件「权限」页选择并批准 DLL，然后在插件配置的「原生组件 SHA-256」填写授权时显示的摘要。也可显式运行 `Install-Native.ps1`，并指定 BMCBL 状态目录和本机库。使用此脚本前先关闭 BMCBL，以免和运行中的资源管理竞争。
+优化后的 DLL 位于 `target/native-release/paperconnect_native.dll`。在新版 BMCBL 中导入 `dist/paperconnect-0.1.3.bmcblx`。从插件「权限」页选择并批准 DLL，然后在插件配置的「原生组件 SHA-256」填写授权时显示的摘要。也可显式运行 `Install-Native.ps1`，并指定 BMCBL 状态目录和本机库。使用此脚本前先关闭 BMCBL，以免和运行中的资源管理竞争。
 
 `native-release` 使用 `panic = "abort"`。发布的原生组件在 BMCBL 进程内运行，发生 panic 时会终止该进程。
 
@@ -19,7 +19,7 @@ Windows 的状态目录是 `BMCBL.exe` 旁边的 `BMCBL`。Linux 使用 BMCBL �
 
 ## 安装和更新
 
-从 [GitHub Releases](https://github.com/BMCBL/PaperConnect/releases) 取得 `.bmcblx` 后，在 BMCBL 中导入。进入「工具 → PaperConnect」，点击「安装原生组件」。插件从 GitHub Releases 的静态版本清单读取最新稳定版和资产 SHA-256，按操作系统、架构和 ABI 选择 DLL 或 SO。二进制使用 BMCBL 下载器，遵循启动器的 GitHub 自动镜像、直连或自定义加速设置。
+可在新版 BMCBL 的「下载 → 插件」安装 PaperConnect，也可从 [GitHub Releases](https://github.com/BMCBL/PaperConnect/releases) 获取 `.bmcblx` 后导入。进入「工具 → 联机大厅」，点击「安装原生组件」。插件按操作系统、架构和 ABI 选择 DLL 或 SO。Registry 提供经过校验的 EdgeOne 和 GitHub 线路。目录不可用或版本滞后时，插件读取 GitHub 的发布清单；GitHub 下载遵循启动器的自动镜像、直连或自定义加速设置。
 
 下载并校验后，BMCBL 会显示原生组件授权提示。确认后，PaperConnect 自动保存已选择的版本与摘要。后续可在子页检查更新，已打开的原生组件会在插件重载后切换。
 
