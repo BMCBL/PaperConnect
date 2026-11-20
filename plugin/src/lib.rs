@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::VecDeque;
 
 use bmcbl_plugin_api::r#async::Job;
 use bmcbl_plugin_api::native::{self, InstanceHandle, ModuleHandle, RequestId};
@@ -27,6 +28,10 @@ struct PageState {
     snapshot: Snapshot,
     ports: Option<Vec<u16>>,
     message: String,
+    activity: VecDeque<String>,
+    room_code: String,
+    advanced: bool,
+    port_input: Option<String>,
     sequence: u64,
 }
 
@@ -52,6 +57,15 @@ impl PageState {
         if self.command_pending() {
             return Err(plugin_error("busy", "正在执行上一条联机命令。"));
         }
+        let activity = match &command {
+            Command::Host { .. } => "正在创建房间",
+            Command::Join { .. } => "正在加入房间",
+            Command::Stop => "正在断开联机",
+            Command::RetryTransport => "正在重试本机游戏发现",
+            Command::DetectPorts => "正在检测游戏 UDP 端口",
+            Command::CheckNat => "正在检测 NAT 类型",
+            Command::Snapshot => "正在刷新会话",
+        };
         match self.connection {
             Connection::Ready(instance) => {
                 self.submit = Some(send(instance, &command)?);
@@ -68,7 +82,8 @@ impl PageState {
                 return Err(plugin_error("busy", "联机组件正在启动。"));
             }
         }
-        self.message = "正在执行联机命令…".into();
+        self.message = String::new();
+        self.record_activity(activity);
         Ok(())
     }
 
@@ -90,13 +105,15 @@ impl PageState {
                         return Err(error);
                     }
                 };
-                if let Some(command) = self.pending.take() {
-                    self.submit = Some(send(instance, &command)?);
-                }
                 Connection::Ready(instance)
             }
             other => other,
         };
+        if let Connection::Ready(instance) = self.connection
+            && let Some(command) = self.pending.take()
+        {
+            self.submit = Some(send(instance, &command)?);
+        }
         if self.submit.as_ref().is_some_and(|job| job.is_ready(event)) {
             self.request = Some(ready(self.submit.take().expect("matched submit job"))?);
             if let Some((id, message)) = self.early_result.take() {
@@ -140,8 +157,32 @@ impl PageState {
                 Event::Failed { request, message } => self.finish_command(request, message),
                 Event::Cancelled { request } => self.finish_command(request, "操作已取消。".into()),
                 Event::Ports { ports } => self.ports = Some(ports),
-                Event::Snapshot { snapshot } => self.snapshot = snapshot,
-                Event::RoomChanged { room } => self.snapshot.room = room,
+                Event::Snapshot { snapshot } => {
+                    if self.snapshot.room.is_some() && snapshot.room.is_none() {
+                        self.record_activity("已断开联机");
+                    }
+                    self.snapshot = snapshot;
+                }
+                Event::RoomChanged { room } => {
+                    if let Some(room) = &room {
+                        if self.snapshot.room.is_none() {
+                            self.record_activity(if room.is_host {
+                                "房间已创建"
+                            } else {
+                                "已加入房间"
+                            });
+                            if room.is_host
+                                && let Err(error) =
+                                    bmcbl_plugin_api::write_clipboard_text(&room.code)
+                            {
+                                self.message = error.message;
+                            }
+                        }
+                    } else {
+                        self.record_activity("已断开联机");
+                    }
+                    self.snapshot.room = room;
+                }
                 Event::PlayersChanged { joined, left } => {
                     self.snapshot
                         .players
@@ -175,11 +216,45 @@ impl PageState {
 }
 
 impl PageState {
+    fn record_activity(&mut self, message: impl Into<String>) {
+        if self.activity.len() == 8 {
+            self.activity.pop_front();
+        }
+        self.activity.push_back(message.into());
+    }
+
+    fn save_preferences(&mut self) -> PluginResult<()> {
+        let raw = self.port_input.as_deref().unwrap_or_default().trim();
+        let port = if raw.is_empty() || raw == "0" {
+            0
+        } else {
+            raw.parse::<u16>()
+                .ok()
+                .filter(|port| *port >= 1025)
+                .ok_or_else(|| plugin_error("game-port", "端口应为 1025–65535，留空时自动探测。"))?
+        };
+        let mut document = read_config()?
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|error| plugin_error("config", error.to_string()))?;
+        document["player_name"] = toml_edit::value(self.config.player_name.trim());
+        document["game_port"] = toml_edit::value(i64::from(port));
+        document["bootstrap_peers"] = toml_edit::value(self.config.bootstrap_peers.trim());
+        document["disable_p2p"] = toml_edit::value(self.config.disable_p2p);
+        write_config(document.to_string())?;
+        self.config.game_port = port;
+        self.record_activity("联机选项已保存");
+        self.advanced = false;
+        Ok(())
+    }
+
     fn finish_command(&mut self, request: u64, message: String) {
         let id = RequestId(request);
         if request == 0 || self.request == Some(id) {
             self.request = None;
-            self.message = message;
+            if !message.is_empty() {
+                self.record_activity(message.clone());
+                self.message = message;
+            }
         } else if self.submit.is_some() {
             self.early_result = Some((id, message));
         }
@@ -229,7 +304,8 @@ impl Config {
             player: self.player_name.clone(),
             peers: self
                 .bootstrap_peers
-                .split_whitespace()
+                .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';'))
+                .filter(|peer| !peer.is_empty())
                 .map(str::to_owned)
                 .collect(),
             game_port: (self.game_port >= 1025).then_some(self.game_port),
@@ -243,7 +319,7 @@ impl Plugin for PaperConnect {
     fn init(_context: PluginContext) -> PluginResult<Vec<Registration>> {
         PAGE.with_borrow_mut(|state| state.config = config());
         Ok(registrations! {
-            page "main", title = "PaperConnect", tool = Tool::new("PaperConnect").icon("users").order(100);
+            page "main", title = "创建或加入好友房间", tool = Tool::new("联机大厅").icon("users").order(100);
             subscribe "config-changed";
         })
     }
@@ -255,10 +331,12 @@ impl Plugin for PaperConnect {
                 .is_some_and(|(name, _)| name == "config-changed")
             {
                 state.config = config();
+                state.port_input = None;
                 Ok(true)
             } else if let PluginEventKind::Action(action) = &event.kind {
                 match action.action_id.as_str() {
                     "detect" => state.start(Command::DetectPorts),
+                    "check-nat" => state.start(Command::CheckNat),
                     "host" => match room::generate_room() {
                         Ok(code) => state.start(Command::Host {
                             code,
@@ -266,12 +344,26 @@ impl Plugin for PaperConnect {
                         }),
                         Err(error) => Err(plugin_error("room-code", error.to_string())),
                     },
-                    "join" => {
-                        let input = bmcbl_plugin_api::read_clipboard_text()
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-                        match room::room_from_code(&input) {
+                    "room-code" => {
+                        state.room_code = action.value.clone().unwrap_or_default();
+                        return false;
+                    }
+                    "paste" => {
+                        bmcbl_plugin_api::read_clipboard_text().and_then(|input| {
+                            match input.filter(|text| !text.trim().is_empty()) {
+                                Some(input) => {
+                                    state.room_code = input.trim().replace(['\n', '\r'], " ");
+                                    Ok(())
+                                }
+                                None => Err(plugin_error("room-code", "剪贴板没有联机码。")),
+                            }
+                        })
+                    }
+                    "join" | "room-code-submit" => {
+                        if let Some(value) = &action.value {
+                            state.room_code = value.clone();
+                        }
+                        match room::room_from_code(&state.room_code) {
                             Ok(code) => state.start(Command::Join {
                                 code,
                                 preferences: state.config.preferences(),
@@ -285,6 +377,34 @@ impl Plugin for PaperConnect {
                     },
                     "stop" => state.start(Command::Stop),
                     "retry" => state.start(Command::RetryTransport),
+                    "refresh" => state.start(Command::Snapshot),
+                    "advanced" => {
+                        state.advanced = !state.advanced;
+                        if state.advanced
+                            && state.port_input.is_none()
+                            && state.config.game_port != 0
+                        {
+                            state.port_input = Some(state.config.game_port.to_string());
+                        }
+                        Ok(())
+                    }
+                    "player-name" => {
+                        state.config.player_name = action.value.clone().unwrap_or_default();
+                        return false;
+                    }
+                    "bootstrap-peers" => {
+                        state.config.bootstrap_peers = action.value.clone().unwrap_or_default();
+                        return false;
+                    }
+                    "game-port" => {
+                        state.port_input = action.value.clone();
+                        return false;
+                    }
+                    "disable-p2p" => {
+                        state.config.disable_p2p = action.value.as_deref() == Some("true");
+                        Ok(())
+                    }
+                    "save" => state.save_preferences(),
                     "cancel" => match (&state.connection, state.request) {
                         (Connection::Ready(instance), Some(request))
                             if state.cancel_job.is_none() =>
@@ -309,6 +429,7 @@ impl Plugin for PaperConnect {
             match result {
                 Ok(changed) => changed,
                 Err(error) => {
+                    state.record_activity(error.message.clone());
                     state.message = error.message;
                     if !matches!(state.connection, Connection::Ready(..)) {
                         state.pending = None;

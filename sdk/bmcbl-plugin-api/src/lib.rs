@@ -1040,6 +1040,12 @@ impl View {
         Container::new(LayoutDirection::Row)
     }
 
+    /// A primary column and a secondary column which stack in a compact window.
+    #[must_use]
+    pub fn columns() -> Container {
+        Self::row().align(Align::Stretch).full_width()
+    }
+
     #[must_use]
     pub fn text(value: impl Into<String>) -> Self {
         Self::node(crate::text(value))
@@ -1063,6 +1069,31 @@ impl View {
     #[must_use]
     pub fn button(label: impl Into<String>, action_id: impl Into<String>) -> Self {
         Self::node(button(label, action_id))
+    }
+
+    #[must_use]
+    pub fn secondary_button(label: impl Into<String>, action_id: impl Into<String>) -> Self {
+        let mut node = button(label, action_id);
+        if let ViewNode::Button(button) = &mut node {
+            button.style.color = Some(ThemeToken::SecondaryText);
+        }
+        Self::node(node)
+    }
+
+    /// Dispatches the current text as the action value when the user edits the input.
+    #[must_use]
+    pub fn input(
+        value: impl Into<String>,
+        placeholder: impl Into<String>,
+        action_id: impl Into<String>,
+    ) -> Self {
+        Self::node(ViewNode::Input(InputNode {
+            value: value.into(),
+            placeholder: placeholder.into(),
+            action_id: action_id.into(),
+            action_value: None,
+            style: ViewStyle { full_width: true, ..default_style() },
+        }))
     }
 
     #[must_use]

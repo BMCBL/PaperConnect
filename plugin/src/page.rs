@@ -6,122 +6,323 @@ use super::{Connection, PageState, Update};
 pub(super) const NATIVE_SETUP: &str = "请先安装原生组件，再创建或加入房间。";
 
 pub(super) fn render(state: &PageState) -> ViewTree {
-    let native_available =
+    let component =
         state.config.module_digest().is_some() || matches!(state.connection, Connection::Ready(_));
     let busy = state.command_pending();
-    let mut page = View::column()
-        .padding(6)
+    let room = state.snapshot.room.as_ref();
+    let mut details = View::column().gap(14).full_width();
+    if room.is_some() {
+        details = details.child(members(state));
+    }
+    details = details
+        .child(activity(state))
+        .child(session(state))
+        .child(peers(state));
+    if room.is_none() && !busy {
+        details = details.child(native_component(state, component));
+    }
+
+    View::columns()
         .gap(14)
-        .full_width()
-        .child(View::title("PaperConnect"));
-    if !state.message.is_empty() {
-        page = page.child(detail(&state.message));
-    }
-    page = page.child(room_card(state, native_available, busy));
-    if native_available && (!busy || state.ports.is_some()) {
-        page = page.child(diagnostics_card(state, busy));
-    }
-    if state.snapshot.room.is_none() && !busy {
-        let mut items = vec![View::title("原生组件")];
-        if let Some(version) = &state.config.native_version {
-            items.push(detail(format!("已安装 {version}")));
-        } else if !native_available {
-            items.push(detail(NATIVE_SETUP));
-        }
-        match &state.update {
-            Update::Idle if native_available => {
-                items.push(View::button("检查更新", "check-update"));
-            }
-            Update::Idle => items.push(View::button("安装原生组件", "install")),
-            Update::Available(component) => items.push(View::button(
-                format!("安装 {}", component.version()),
-                "install",
-            )),
-            _ => {}
-        }
-        page = page.child(card(items));
-    }
-    page.finish()
+        .child(room_card(state, component, busy))
+        .child(details.finish_view())
+        .finish()
 }
 
-fn room_card(state: &PageState, native_available: bool, busy: bool) -> View {
-    let room = state.snapshot.room.as_ref();
-    let status = room.map_or("尚未加入房间", |room| {
-        if room.is_host { "房主" } else { "来宾" }
-    });
-    let heading = View::row()
-        .padding(0)
-        .gap(10)
-        .align(Align::Center)
-        .child(View::title("房间"))
-        .child(View::badge(status));
-    let mut items = vec![heading.into()];
-    let mut actions = View::row().padding(0).gap(8).align(Align::Center);
-    if let Some(room) = room {
-        items.push(View::text(format!("房间码  {}", room.code)));
-        items.push(detail(format!(
-            "游戏端口 {}  ·  {} 个节点",
-            room.game_port
-                .map_or_else(|| "等待发现".into(), |port| port.to_string()),
-            state.snapshot.peers.len(),
-        )));
-        if !state.snapshot.players.is_empty() {
-            items.push(detail(format!(
-                "玩家  {}",
-                state.snapshot.players.join("、")
-            )));
-        }
+fn room_card(state: &PageState, component: bool, busy: bool) -> View {
+    let mut body = vec![
+        heading("users", "开始联机"),
+        detail("创建新房间，或使用好友分享的联机码直接加入。"),
+    ];
+
+    if let Some(room) = &state.snapshot.room {
         if room.discovery_port_occupied {
-            items.push(detail("本机发现端口被占用，释放端口后可重试。"));
+            body.push(notice("本机发现端口被占用，关闭占用程序后请重试。"));
+        } else {
+            body.push(View::badge("已连接，可以进入 Minecraft"));
         }
-        actions = actions.child(View::button("复制房间码", "copy"));
+        body.push(inset([
+            detail(if room.is_host {
+                "分享此联机码"
+            } else {
+                "当前房间"
+            }),
+            View::title(room.code.clone()),
+        ]));
+        let mut actions = vec![View::secondary_button("复制联机码", "copy")];
         if !busy {
             if room.discovery_port_occupied {
-                actions = actions.child(View::button("重试发现", "retry"));
+                actions.push(View::button("重试发现", "retry"));
             }
-            actions = actions.child(View::button("退出房间", "stop"));
+            actions.push(View::secondary_button("断开连接", "stop"));
         }
-    } else if native_available && !busy {
-        actions = actions
-            .child(View::button("创建房间", "host"))
-            .child(View::button("从剪贴板加入", "join"));
+        body.push(row(actions));
+    } else if busy {
+        body.push(inset([
+            View::title(
+                state
+                    .activity
+                    .back()
+                    .map(String::as_str)
+                    .unwrap_or("请稍候"),
+            ),
+            detail("正在建立网络，完成后即可进入 Minecraft。"),
+        ]));
+    } else if component {
+        body.push(inset([
+            View::title("创建我的房间"),
+            detail("自动生成联机码并复制到剪贴板"),
+            row([View::button("立即创建", "host")]),
+        ]));
+        body.push(inset([
+            View::title("加入好友房间"),
+            View::input(&state.room_code, "P/NNNN-NNNN-SSSS-SSSS", "room-code"),
+            row([
+                View::secondary_button("粘贴", "paste"),
+                View::button("加入", "join"),
+            ]),
+        ]));
+        body.push(advanced(state));
+    } else {
+        body.push(detail(NATIVE_SETUP));
     }
-    let can_cancel = state.request.is_some() && state.cancel_job.is_none();
-    if can_cancel {
-        actions = actions.child(View::button("取消命令", "cancel"));
+    if state.request.is_some() && state.cancel_job.is_none() {
+        body.push(row([View::secondary_button("取消", "cancel")]));
     }
-    if room.is_some() || (native_available && !busy) || can_cancel {
-        items.push(actions.into());
-    }
-    card(items)
+    panel(body)
 }
 
-fn diagnostics_card(state: &PageState, busy: bool) -> View {
-    let mut items = vec![View::title("本机诊断")];
-    if let Some(ports) = &state.ports {
-        let result = if ports.is_empty() {
-            "未发现正在监听的游戏 UDP 端口。".to_owned()
+fn advanced(state: &PageState) -> View {
+    let mut fields = vec![row([View::secondary_button(
+        if state.advanced {
+            "收起高级选项"
         } else {
-            let ports = ports
-                .iter()
-                .map(u16::to_string)
-                .collect::<Vec<_>>()
-                .join("、");
-            format!("游戏 UDP 端口  {ports}")
+            "高级选项"
+        },
+        "advanced",
+    )])];
+    if state.advanced {
+        fields.extend([
+            detail("玩家名"),
+            View::input(&state.config.player_name, "留空时自动生成", "player-name"),
+            detail("本机游戏端口"),
+            View::input(
+                state.port_input.as_deref().unwrap_or_default(),
+                "自动探测",
+                "game-port",
+            ),
+            detail("引导节点"),
+            View::input(
+                &state.config.bootstrap_peers,
+                "留空以使用公共节点",
+                "bootstrap-peers",
+            ),
+            View::toggle("禁用 P2P", state.config.disable_p2p, "disable-p2p"),
+            row([View::button("保存选项", "save")]),
+        ]);
+    }
+    inset(fields)
+}
+
+fn members(state: &PageState) -> View {
+    let mut content = vec![heading("users", "房间成员")];
+    if state.snapshot.players.is_empty() {
+        content.push(detail("等待玩家进入游戏。"));
+    }
+    content.extend(
+        state
+            .snapshot
+            .players
+            .iter()
+            .take(32)
+            .cloned()
+            .map(View::text),
+    );
+    if !state.command_pending() {
+        content.push(row([View::secondary_button("刷新成员和节点", "refresh")]));
+    }
+    panel(content)
+}
+
+fn activity(state: &PageState) -> View {
+    let mut content = vec![heading("activity", "活动与提示")];
+    if !state.message.is_empty() {
+        content.push(detail(&state.message));
+    }
+    if state.activity.is_empty() {
+        content.push(detail(
+            "创建或加入房间后等待数秒，再进入 Minecraft。大多数游戏使用默认高级选项即可。",
+        ));
+    } else {
+        content.extend(state.activity.iter().rev().map(detail));
+    }
+    panel(content)
+}
+
+fn session(state: &PageState) -> View {
+    let room = state.snapshot.room.as_ref();
+    let status = if state.command_pending() {
+        "正在处理"
+    } else if room.is_some() {
+        "已连接"
+    } else {
+        "等待连接"
+    };
+    let game_port = room
+        .and_then(|room| room.game_port)
+        .map_or_else(|| "连接后显示".to_string(), |port| port.to_string());
+    let mut content = vec![
+        heading("settings", "当前会话"),
+        View::badge(status),
+        detail(format!(
+            "虚拟 IP  {}",
+            room.and_then(|room| room.virtual_ip.as_deref())
+                .unwrap_or("连接后显示")
+        )),
+        detail(format!(
+            "节点名称  {}",
+            room.and_then(|room| room.hostname.as_deref())
+                .unwrap_or("连接后显示")
+        )),
+        detail(match room.and_then(|room| room.game_host.as_deref()) {
+            Some(host) => format!("Minecraft 地址  {host}:{game_port}"),
+            None => format!("Minecraft 端口  {game_port}"),
+        }),
+    ];
+    if let Some(ports) = &state.ports {
+        let text = if ports.is_empty() {
+            "未发现正在监听的游戏 UDP 端口。".to_string()
+        } else {
+            format!(
+                "本机游戏端口  {}",
+                ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join("、")
+            )
         };
-        items.push(detail(result));
+        content.push(detail(text));
     }
-    if !busy {
-        items.push(View::button("检测游戏 UDP 端口", "detect"));
+    let nat = state.snapshot.nat.map_or_else(
+        || "尚未检测 NAT".into(),
+        |nat| format!("NAT  UDP {} · TCP {}", nat_type(nat.udp), nat_type(nat.tcp)),
+    );
+    content.push(detail(nat));
+    if state.config.module_digest().is_some() && !state.command_pending() {
+        content.push(row([
+            View::secondary_button("检测游戏 UDP 端口", "detect"),
+            View::secondary_button("检测 NAT", "check-nat"),
+        ]));
     }
-    card(items)
+    panel(content)
+}
+
+fn nat_type(value: i32) -> &'static str {
+    match value {
+        1 => "开放网络",
+        2 => "完全锥形",
+        3 => "受限锥形",
+        4 => "端口受限",
+        5 => "对称型",
+        _ => "未知",
+    }
+}
+
+fn peers(state: &PageState) -> View {
+    let mut content = vec![heading("network", "网络节点")];
+    if state.snapshot.peers.is_empty() {
+        content.push(detail("连接房间后可查看局域网节点与中转信息。"));
+    }
+    for peer in state.snapshot.peers.iter().take(32) {
+        let latency = peer
+            .latency_ms
+            .map_or_else(|| "延迟未知".to_owned(), |ms| format!("{ms} ms"));
+        let name = if peer.hostname.is_empty() {
+            &peer.id
+        } else {
+            &peer.hostname
+        };
+        content.push(detail(format!("{name}  ·  {latency}")));
+        if let Some(relay) = &peer.relay {
+            content.push(detail(format!("经由 {relay} 中转")));
+        } else if let Some(protocol) = &peer.protocol {
+            content.push(detail(protocol));
+        }
+    }
+    panel(content)
+}
+
+fn native_component(state: &PageState, installed: bool) -> View {
+    let mut content = vec![heading("plug", "原生组件")];
+    if let Some(version) = &state.config.native_version {
+        content.push(detail(format!("已安装 v{version}")));
+    }
+    match &state.update {
+        Update::Idle if installed => {
+            content.push(row([View::secondary_button("检查更新", "check-update")]))
+        }
+        Update::Idle => content.push(row([View::button("安装原生组件", "install")])),
+        Update::Available(component) => content.push(row([View::button(
+            format!("安装 {}", component.version()),
+            "install",
+        )])),
+        _ => {}
+    }
+    panel(content)
+}
+
+fn heading(icon: &str, title: &str) -> View {
+    View::row()
+        .align(Align::Center)
+        .gap(8)
+        .child(View::node(bmcbl_plugin_api::icon(icon)))
+        .child(View::title(title))
+        .finish_view()
+}
+
+fn row(children: impl IntoIterator<Item = View>) -> View {
+    let mut row = View::row().gap(8).align(Align::Center);
+    for child in children {
+        row = row.child(child);
+    }
+    row.finish_view()
+}
+
+fn panel(children: impl IntoIterator<Item = View>) -> View {
+    let mut panel = View::column()
+        .full_width()
+        .gap(14)
+        .padding(18)
+        .corner_radius(16)
+        .background(ThemeToken::Surface);
+    for child in children {
+        panel = panel.child(child);
+    }
+    panel.finish_view()
+}
+
+fn inset(children: impl IntoIterator<Item = View>) -> View {
+    let mut inner = View::column().full_width().gap(9).padding(8);
+    for child in children {
+        inner = inner.child(child);
+    }
+    inner.finish_view()
 }
 
 fn detail(text: impl Into<String>) -> View {
+    text_with_color(text, ThemeToken::SecondaryText)
+}
+
+fn notice(text: impl Into<String>) -> View {
+    text_with_color(text, ThemeToken::Danger)
+}
+
+fn text_with_color(text: impl Into<String>, color: ThemeToken) -> View {
     View::node(ViewNode::Text(TextNode {
         text: text.into(),
         style: ViewStyle {
-            color: Some(ThemeToken::SecondaryText),
+            color: Some(color),
             full_width: true,
             ..default_style()
         },
@@ -157,9 +358,23 @@ mod tests {
             },
             ..PageState::default()
         };
+        let page = render(&state);
         assert_eq!(
-            actions(&render(&state)),
-            ["host", "join", "detect", "check-update"]
+            actions(&page),
+            [
+                "host",
+                "paste",
+                "join",
+                "advanced",
+                "detect",
+                "check-nat",
+                "check-update"
+            ]
+        );
+        assert!(
+            page.nodes.iter().any(
+                |node| matches!(node, ViewNode::Input(input) if input.action_id == "room-code")
+            )
         );
         state.request = Some(RequestId(1));
         assert_eq!(actions(&render(&state)), ["cancel"]);
@@ -168,18 +383,12 @@ mod tests {
             code: "ROOM".into(),
             is_host: true,
             game_port: None,
-            discovery_port_occupied: false,
+            discovery_port_occupied: true,
+            ..Room::default()
         });
-        assert_eq!(actions(&render(&state)), ["copy", "stop", "detect"]);
-        state
-            .snapshot
-            .room
-            .as_mut()
-            .unwrap()
-            .discovery_port_occupied = true;
         assert_eq!(
             actions(&render(&state)),
-            ["copy", "retry", "stop", "detect"]
+            ["copy", "retry", "stop", "refresh", "detect", "check-nat"]
         );
     }
 }

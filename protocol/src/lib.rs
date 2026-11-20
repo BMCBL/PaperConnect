@@ -15,6 +15,7 @@ pub struct Preferences {
 pub enum Command {
     Snapshot,
     DetectPorts,
+    CheckNat,
     RetryTransport,
     Host {
         code: String,
@@ -33,6 +34,12 @@ pub struct Room {
     pub is_host: bool,
     pub game_port: Option<u16>,
     pub discovery_port_occupied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -40,6 +47,14 @@ pub struct Snapshot {
     pub room: Option<Room>,
     pub players: Vec<String>,
     pub peers: Vec<Peer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nat: Option<Nat>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Nat {
+    pub udp: i32,
+    pub tcp: i32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -47,6 +62,10 @@ pub struct Peer {
     pub id: String,
     pub hostname: String,
     pub latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

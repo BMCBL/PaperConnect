@@ -264,6 +264,12 @@ async fn apply(command: Command, state: &mut Snapshot, events: &Events) -> Resul
                 .map_err(|error| error.to_string())??;
             events.publish(Event::Ports { ports });
         }
+        Command::CheckNat => {
+            state.nat = Some(check_nat().await);
+            events.publish(Event::Snapshot {
+                snapshot: state.clone(),
+            });
+        }
         Command::Host { code, preferences } | Command::Join { code, preferences } => {
             if state.room.is_some() {
                 return Err("请先退出当前房间".into());
@@ -304,6 +310,26 @@ async fn apply(command: Command, state: &mut Snapshot, events: &Events) -> Resul
     Ok(())
 }
 
+async fn check_nat() -> paperconnect_protocol::Nat {
+    use ::easytier::common::stun::{StunInfoCollector, StunInfoCollectorTrait};
+
+    let collector = StunInfoCollector::new_with_default_servers();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+    loop {
+        let info = collector.get_stun_info();
+        if info.udp_nat_type != 0
+            || info.tcp_nat_type != 0
+            || tokio::time::Instant::now() >= deadline
+        {
+            return paperconnect_protocol::Nat {
+                udp: info.udp_nat_type,
+                tcp: info.tcp_nat_type,
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 async fn start_room(code: &str, preferences: Preferences, is_host: bool) -> Result<Room, String> {
     let room = paperconnect::room_from_code(code)?;
     let player = preferences.player.trim();
@@ -311,7 +337,8 @@ async fn start_room(code: &str, preferences: Preferences, is_host: bool) -> Resu
         return Err("玩家名或节点设置超出限制".into());
     }
     let player = if player.is_empty() {
-        "PaperConnect".to_owned()
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        format!("Player-{}", &id[..8])
     } else {
         player.to_owned()
     };
@@ -340,13 +367,14 @@ async fn start_room(code: &str, preferences: Preferences, is_host: bool) -> Resu
         online::paperconnect_guest::start(server, player).await?
             == online::PaperConnectClientState::DiscoveryPortOccupied
     };
-    let game_port = easytier::status()
-        .await?
-        .and_then(|status| status.game_port);
+    let status = easytier::status().await?;
     Ok(Room {
         code: room.room_code,
         is_host,
-        game_port,
+        game_port: status.as_ref().and_then(|status| status.game_port),
+        virtual_ip: status.as_ref().and_then(|status| status.ipv4.clone()),
+        hostname: status.as_ref().map(|status| status.hostname.clone()),
+        game_host: status.and_then(|status| status.game_host),
         discovery_port_occupied,
     })
 }
@@ -376,6 +404,8 @@ async fn refresh_status(state: &mut Snapshot, events: &Events) {
                     id: id.clone(),
                     hostname,
                     latency_ms: peer.latency_ms,
+                    protocol: peer.protocol,
+                    relay: peer.via_hostname,
                 };
                 (id, view)
             })
