@@ -1,0 +1,5 @@
+native_sha256 = ""
+player_name = ""
+bootstrap_peers = ""
+game_port = 0
+disable_p2p = false

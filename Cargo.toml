@@ -1,0 +1,49 @@
+[package]
+name = "paperconnect"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+publish = false
+description = "PaperConnect multiplayer tool for BMCBL"
+
+[workspace]
+members = ["native", "protocol"]
+default-members = ["."]
+exclude = ["sdk/bmcbl-plugin-api", "sdk/bmcbl-plugin-macros", "vendor/easytier", "vendor/easytier-bmcbl", "vendor/nethernet", "vendor/raknet"]
+
+[lib]
+path = "plugin/src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bmcbl_plugin_api = { path = "sdk/bmcbl-plugin-api" }
+getrandom = "0.4"
+serde_json = "1"
+semver = "1"
+toml_edit = "0.22"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+paperconnect-protocol = { path = "protocol" }
+
+[build-dependencies]
+bmcbl_plugin_api = { path = "sdk/bmcbl-plugin-api", features = ["pack"] }
+
+[package.metadata.bmcbl-plugin]
+id = "paperconnect"
+name = "PaperConnect"
+description = "Bedrock multiplayer and local UDP diagnostics"
+capabilities = ["ui.page", "clipboard.read", "clipboard.write", "config.read", "config.write", "event.global", "download.start"]
+readme = "README.md"
+config_default = "config/default.toml"
+config_schema = "config/schema.toml"
+
+[package.metadata.bmcbl-plugin.permissions.network]
+allow = [
+    "https://api.github.com/repos/BMCBL/PaperConnect/releases/latest",
+    "https://github.com/BMCBL/PaperConnect/releases/download/",
+]
+
+[patch.crates-io]
+dtls = { path = "vendor/dtls" }
+webrtc = { path = "vendor/webrtc" }
+webrtc-ice = { path = "vendor/webrtc-ice" }

@@ -1,0 +1,32 @@
+[[fields]]
+key = "native_sha256"
+type = "string"
+label = "原生组件 SHA-256"
+description = "选择已安装并批准的版本。"
+default = ""
+
+[[fields]]
+key = "player_name"
+type = "string"
+label = "联机玩家名"
+default = ""
+
+[[fields]]
+key = "bootstrap_peers"
+type = "string"
+label = "引导节点"
+description = "多个节点用空格隔开，留空使用默认节点。"
+default = ""
+
+[[fields]]
+key = "game_port"
+type = "integer"
+label = "本机游戏端口"
+description = "0 表示自动探测。"
+default = 0
+
+[[fields]]
+key = "disable_p2p"
+type = "bool"
+label = "禁用 P2P"
+default = false
