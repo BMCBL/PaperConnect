@@ -11,7 +11,9 @@ $env:BMCBL_PLUGIN_PACKAGE_OUT_DIR = Join-Path $PWD 'dist'
 cargo build --locked -p paperconnect --target wasm32-wasip2
 ```
 
-优化后的 DLL 位于 `target/native-release/paperconnect_native.dll`。在新版 BMCBL 中导入 `dist/paperconnect-0.1.1.bmcblx`。从插件「权限」页选择并批准 DLL，然后在插件配置的「原生组件 SHA-256」填写授权时显示的摘要。也可显式运行 `Install-Native.ps1`，并指定 BMCBL 状态目录和本机库。使用此脚本前先关闭 BMCBL，以免和运行中的资源管理竞争。
+优化后的 DLL 位于 `target/native-release/paperconnect_native.dll`。在新版 BMCBL 中导入 `dist/paperconnect-0.1.2.bmcblx`。从插件「权限」页选择并批准 DLL，然后在插件配置的「原生组件 SHA-256」填写授权时显示的摘要。也可显式运行 `Install-Native.ps1`，并指定 BMCBL 状态目录和本机库。使用此脚本前先关闭 BMCBL，以免和运行中的资源管理竞争。
+
+`native-release` 使用 `panic = "abort"`。发布的原生组件在 BMCBL 进程内运行，发生 panic 时会终止该进程。
 
 Windows 的状态目录是 `BMCBL.exe` 旁边的 `BMCBL`。Linux 使用 BMCBL 的 XDG 状态目录。按实际发行的 OS、架构和工具链环境构建原生库。Wasm 包可在各宿主使用。
 
