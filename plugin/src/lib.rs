@@ -27,11 +27,13 @@ struct PageState {
     read: Option<Job<Vec<u8>>>,
     request: Option<RequestId>,
     cancel_job: Option<Job<()>>,
-    early_result: Option<(RequestId, String)>,
+    early_result: Option<(RequestId, CommandOutcome)>,
+    operation: Option<&'static str>,
     update: Update,
     snapshot: Snapshot,
     ports: Option<Vec<u16>>,
     message: String,
+    problem: Option<String>,
     activity: VecDeque<String>,
     room_code: String,
     settings: settings::Settings,
@@ -47,6 +49,12 @@ enum Connection {
     Loading(Job<ModuleHandle>),
     Creating(ModuleHandle, Job<InstanceHandle>),
     Ready(InstanceHandle),
+}
+
+enum CommandOutcome {
+    Completed,
+    Failed(String),
+    Cancelled,
 }
 
 thread_local! {
@@ -67,15 +75,16 @@ impl PageState {
         if self.command_pending() {
             return Err(plugin_error("busy", "正在执行上一条联机命令。"));
         }
-        let activity = match &command {
-            Command::Host { .. } => "正在创建房间",
-            Command::Join { .. } => "正在加入房间",
-            Command::Stop => "正在断开联机",
-            Command::RetryTransport => "正在重试本机游戏发现",
-            Command::DetectPorts => "正在检测游戏 UDP 端口",
-            Command::CheckNat => "正在检测 NAT 类型",
-            Command::Snapshot => "正在刷新会话",
+        let operation = match &command {
+            Command::Host { .. } => "创建房间",
+            Command::Join { .. } => "加入房间",
+            Command::Stop => "断开联机",
+            Command::RetryTransport => "重试本机游戏发现",
+            Command::DetectPorts => "检测游戏 UDP 端口",
+            Command::CheckNat => "检测 NAT 类型",
+            Command::Snapshot => "刷新会话",
         };
+        log_info!("PaperConnect {operation}开始");
         match self.connection {
             Connection::Ready(instance) => {
                 self.submit = Some(send(instance, &command)?);
@@ -85,15 +94,19 @@ impl PageState {
                     .config
                     .module_digest()
                     .ok_or_else(|| plugin_error("native-component", page::NATIVE_SETUP))?;
-                self.connection = Connection::Loading(native::load(digest)?);
+                log_info("PaperConnect 正在加载原生组件");
+                self.connection = Connection::Loading(
+                    native::load(digest).map_err(|error| stage_error("加载原生组件", error))?,
+                );
                 self.pending = Some(command);
             }
             Connection::Loading(_) | Connection::Creating(_, _) => {
                 return Err(plugin_error("busy", "联机组件正在启动。"));
             }
         }
-        self.message = String::new();
-        self.record_activity(activity);
+        self.operation = Some(operation);
+        self.message.clear();
+        self.problem = None;
         Ok(())
     }
 
@@ -110,10 +123,11 @@ impl PageState {
                             error.code.as_str(),
                             "app" | "denied" | "invalid-input" | "not-found"
                         );
-                        return Err(error);
+                        return Err(stage_error("加载原生组件", error));
                     }
                 };
-                Connection::Creating(module, native::create_instance(module, &[])?)
+                log_info("PaperConnect 原生组件已加载，正在创建会话");
+                Connection::Creating(module, start_instance(module)?)
             }
             Connection::Creating(module, job) if job.is_ready(event) => {
                 changed = true;
@@ -121,9 +135,10 @@ impl PageState {
                     Ok(instance) => instance,
                     Err(error) => {
                         let _ = native::unload(module);
-                        return Err(error);
+                        return Err(stage_error("创建原生会话", error));
                     }
                 };
+                log_info("PaperConnect 原生会话已就绪");
                 Connection::Ready(instance)
             }
             other => other,
@@ -134,9 +149,16 @@ impl PageState {
             self.submit = Some(send(instance, &command)?);
         }
         if self.submit.as_ref().is_some_and(|job| job.is_ready(event)) {
-            self.request = Some(ready(self.submit.take().expect("matched submit job"))?);
-            if let Some((id, message)) = self.early_result.take() {
-                self.finish_command(id.0, message);
+            let id = ready(self.submit.take().expect("matched submit job"))
+                .map_err(|error| stage_error("提交原生命令", error))?;
+            self.request = Some(id);
+            log_info!(
+                "PaperConnect {}已提交，请求 #{}",
+                self.operation.unwrap_or("同步会话"),
+                id.0
+            );
+            if let Some((id, outcome)) = self.early_result.take() {
+                self.finish_command(id.0, outcome);
             }
             changed = true;
         }
@@ -149,7 +171,8 @@ impl PageState {
             changed = true;
         }
         if self.read.as_ref().is_some_and(|job| job.is_ready(event)) {
-            let bytes = ready(self.read.take().expect("matched read job"))?;
+            let bytes = ready(self.read.take().expect("matched read job"))
+                .map_err(|error| stage_error("读取原生事件", error))?;
             if !bytes.is_empty() {
                 self.apply_batch(&bytes)?;
                 changed = true;
@@ -172,10 +195,19 @@ impl PageState {
             gap |= self.sequence != 0 && item.sequence != self.sequence + 1;
             self.sequence = item.sequence;
             match item.event {
-                Event::Completed { request } => self.finish_command(request, String::new()),
-                Event::Failed { request, message } => self.finish_command(request, message),
-                Event::Cancelled { request } => self.finish_command(request, "操作已取消。".into()),
-                Event::Ports { ports } => self.ports = Some(ports),
+                Event::Completed { request } => {
+                    self.finish_command(request, CommandOutcome::Completed);
+                }
+                Event::Failed { request, message } => {
+                    self.finish_command(request, CommandOutcome::Failed(message));
+                }
+                Event::Cancelled { request } => {
+                    self.finish_command(request, CommandOutcome::Cancelled);
+                }
+                Event::Ports { ports } => {
+                    log_info!("PaperConnect 本机游戏 UDP 端口：{ports:?}");
+                    self.ports = Some(ports);
+                }
                 Event::Snapshot { snapshot } => {
                     if self.snapshot.room.is_some() && snapshot.room.is_none() {
                         self.record_activity("已断开联机");
@@ -194,7 +226,7 @@ impl PageState {
                                 && let Err(error) =
                                     bmcbl_plugin_api::write_clipboard_text(&room.code)
                             {
-                                self.message = error.message;
+                                self.report_problem(stage_error("复制联机码", error).message);
                             }
                         }
                     } else {
@@ -223,10 +255,11 @@ impl PageState {
                         }
                     }
                 }
-                Event::NetworkError { message } => self.message = message,
+                Event::NetworkError { message } => self.report_problem(message),
             }
         }
         if gap && let Connection::Ready(instance) = self.connection {
+            log_warn("PaperConnect 原生事件存在缺口，正在同步会话");
             self.request = None;
             self.submit = Some(send(instance, &Command::Snapshot)?);
         }
@@ -242,18 +275,45 @@ impl PageState {
         self.activity.push_back(message.into());
     }
 
-    fn finish_command(&mut self, request: u64, message: String) {
+    fn report_problem(&mut self, message: String) {
+        log_warn!("PaperConnect {message}");
+        self.record_activity(message.clone());
+        self.problem = Some(message);
+    }
+
+    fn finish_command(&mut self, request: u64, outcome: CommandOutcome) {
         let id = RequestId(request);
         if request == 0 || self.request == Some(id) {
             self.request = None;
-            if !message.is_empty() {
-                self.record_activity(message.clone());
-                self.message = message;
+            let operation = self.operation.take().unwrap_or("同步会话");
+            match outcome {
+                CommandOutcome::Completed => {
+                    log_info!("PaperConnect {operation}已完成，请求 #{request}");
+                }
+                CommandOutcome::Failed(message) => {
+                    self.report_problem(format!("{operation}失败：{message}"));
+                }
+                CommandOutcome::Cancelled => {
+                    log_info!("PaperConnect {operation}已取消，请求 #{request}");
+                    self.message = format!("{operation}已取消。");
+                }
             }
         } else if self.submit.is_some() {
-            self.early_result = Some((id, message));
+            self.early_result = Some((id, outcome));
         }
     }
+}
+
+fn stage_error(stage: &str, mut error: PluginError) -> PluginError {
+    error.message = format!("{stage}失败（{}）：{}", error.code, error.message);
+    error
+}
+
+fn start_instance(module: ModuleHandle) -> PluginResult<Job<InstanceHandle>> {
+    native::create_instance(module, &[]).map_err(|error| {
+        let _ = native::unload(module);
+        stage_error("创建原生会话", error)
+    })
 }
 
 fn ready<T: serde::de::DeserializeOwned>(job: Job<T>) -> PluginResult<T> {
@@ -264,7 +324,7 @@ fn ready<T: serde::de::DeserializeOwned>(job: Job<T>) -> PluginResult<T> {
 fn send(instance: InstanceHandle, command: &Command) -> PluginResult<Job<RequestId>> {
     let bytes =
         serde_json::to_vec(command).map_err(|error| plugin_error("command", error.to_string()))?;
-    native::submit_command(instance, &bytes)
+    native::submit_command(instance, &bytes).map_err(|error| stage_error("提交原生命令", error))
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -313,6 +373,7 @@ impl Config {
 impl Plugin for PaperConnect {
     fn init(_context: PluginContext) -> PluginResult<Vec<Registration>> {
         PAGE.with_borrow_mut(|state| state.config = config());
+        log_info!("PaperConnect v{} 联机大厅已注册", env!("CARGO_PKG_VERSION"));
         Ok(registrations! {
             page "main", title = "创建或加入好友房间", tool = Tool::new("联机大厅").icon("users").order(100);
             page settings::PAGE_ID, title = "联机设置";
@@ -339,6 +400,20 @@ impl Plugin for PaperConnect {
                 state.config = config;
                 Ok(true)
             } else if let PluginEventKind::Action(action) = &event.kind {
+                if matches!(
+                    action.action_id.as_str(),
+                    "host"
+                        | "join"
+                        | "room-code-submit"
+                        | "paste"
+                        | "copy"
+                        | "install"
+                        | "check-update"
+                ) && !state.command_pending()
+                {
+                    state.problem = None;
+                    state.message.clear();
+                }
                 match action.action_id.as_str() {
                     "detect" => state.start(Command::DetectPorts),
                     "check-nat" => state.start(Command::CheckNat),
@@ -422,11 +497,13 @@ impl Plugin for PaperConnect {
             match result {
                 Ok(changed) => changed,
                 Err(error) => {
-                    state.record_activity(error.message.clone());
-                    state.message = error.message;
                     if !matches!(state.connection, Connection::Ready(..)) {
                         state.pending = None;
                     }
+                    if !state.command_pending() {
+                        state.operation = None;
+                    }
+                    state.report_problem(error.message);
                     true
                 }
             }

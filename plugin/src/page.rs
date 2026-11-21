@@ -3,7 +3,7 @@ use bmcbl_plugin_api::{ButtonNode, Container, InputNode, TextNode, TextSizeToken
 use paperconnect_protocol::Room;
 
 use super::details::{self, Section};
-use super::{PageState, Update};
+use super::{Connection, PageState, Update};
 
 pub(super) const NATIVE_SETUP: &str = "安装原生组件后即可创建或加入房间。";
 
@@ -13,28 +13,27 @@ pub(super) fn render(state: &PageState) -> ViewTree {
     }
 
     let busy = state.command_pending();
-    page_body()
-        .gap(8)
+    let mut page = page_body()
         .child(room_controls(state, busy))
-        .child(View::node(ViewNode::Separator))
         .child(session(state, busy))
-        .child(View::node(ViewNode::Separator))
-        .child(network_nodes(state))
-        .child(View::node(ViewNode::Separator))
-        .child(activity(state))
-        .finish()
+        .child(network_nodes(state));
+    if let Some(recent) = activity(state) {
+        page = page.child(recent);
+    }
+    page.finish()
 }
 
 fn room_controls(state: &PageState, busy: bool) -> View {
-    let mut body = page_body().gap(8);
+    let mut body = panel().child(heading("users", "多人联机"));
+    if let Some(status) = feedback(state) {
+        body = body.child(status);
+    }
     if let Some(room) = state.snapshot.room.as_ref() {
-        body = body
-            .child(View::title("房间已连接"))
-            .child(connected(room, busy));
+        body = body.child(connected(room, busy));
     } else if !busy {
         body = body
-            .child(View::title("多人联机"))
             .child(create_room())
+            .child(View::node(ViewNode::Separator))
             .child(join_form(state));
     }
     if busy {
@@ -46,8 +45,17 @@ fn room_controls(state: &PageState, busy: bool) -> View {
 }
 
 fn pending_action(state: &PageState) -> View {
-    let operation = state.activity.back().map_or("正在处理", String::as_str);
-    let mut progress = row().full_width().child(label(operation));
+    let operation = state.operation.unwrap_or("同步会话");
+    let stage = match state.connection {
+        Connection::Loading(_) => "正在加载原生组件",
+        Connection::Creating(..) => "正在创建原生会话",
+        _ if state.cancel_job.is_some() => "正在取消",
+        _ if state.submit.is_some() => "正在提交请求",
+        _ => "正在等待结果",
+    };
+    let mut progress = row()
+        .full_width()
+        .child(label(&format!("{operation} · {stage}")));
     if state.request.is_some() && state.cancel_job.is_none() {
         progress = progress.child(flat_action("取消操作", "cancel"));
     }
@@ -55,11 +63,11 @@ fn pending_action(state: &PageState) -> View {
 }
 
 fn component_setup(state: &PageState) -> ViewTree {
-    let mut setup = page_body()
+    let mut setup = panel()
         .child(heading("plug", "下载原生组件"))
         .child(detail(NATIVE_SETUP));
-    if !state.message.is_empty() {
-        setup = setup.child(detail(&state.message));
+    if let Some(status) = feedback(state) {
+        setup = setup.child(status);
     }
     match &state.update {
         Update::Idle => {
@@ -81,13 +89,20 @@ fn component_setup(state: &PageState) -> ViewTree {
     setup.finish()
 }
 
+fn feedback(state: &PageState) -> Option<View> {
+    if let Some(problem) = &state.problem {
+        return Some(text(problem, ThemeToken::Danger, true, true));
+    }
+    (!state.message.is_empty()).then(|| detail(&state.message))
+}
+
 fn create_room() -> View {
     row()
         .full_width()
         .child(
             section("创建我的房间")
                 .gap(4)
-                .child(detail("联机码会自动复制到剪贴板。")),
+                .child(detail("先在游戏中进入世界，并开启多人游戏和局域网可见。")),
         )
         .child(compact_action("创建房间", "host", ThemeToken::Accent))
         .finish_view()
@@ -162,28 +177,20 @@ fn lobby_actions(state: &PageState) -> View {
     actions.finish_view()
 }
 
-fn activity(state: &PageState) -> View {
-    let mut body = page_body()
-        .gap(4)
-        .child(section_title("activity", "活动与提示"));
-    if !state.message.is_empty() {
-        body = body.child(detail(&state.message));
-    }
-    if state.activity.is_empty() && state.message.is_empty() {
-        body = body.child(detail(
-            "创建或加入房间后，在 Minecraft 好友列表中进入局域网游戏。",
-        ));
-    }
-    for line in state
+fn activity(state: &PageState) -> Option<View> {
+    let mut recent = state
         .activity
         .iter()
         .rev()
-        .filter(|line| *line != &state.message)
+        .filter(|line| Some(line.as_str()) != state.problem.as_deref())
         .take(3)
-    {
+        .peekable();
+    recent.peek()?;
+    let mut body = panel().gap(4).child(section_title("activity", "最近活动"));
+    for line in recent {
         body = body.child(detail(line));
     }
-    body.finish_view()
+    Some(body.finish_view())
 }
 
 fn session(state: &PageState, busy: bool) -> View {
@@ -211,8 +218,8 @@ fn session(state: &PageState, busy: bool) -> View {
     };
     let expanded = state.expanded_details == Some(Section::Diagnostics);
     let caption = if expanded { "收起诊断" } else { "诊断" };
-    let mut body = page_body()
-        .gap(4)
+    let mut body = panel()
+        .gap(6)
         .child(section_header(
             "users",
             "当前会话",
@@ -227,7 +234,9 @@ fn session(state: &PageState, busy: bool) -> View {
         ))
         .child(session_field("NAT", nat.as_deref().unwrap_or("尚未检测")));
     if expanded {
-        body = body.child(details::diagnostics(state));
+        body = body
+            .child(View::node(ViewNode::Separator))
+            .child(details::diagnostics(state));
     }
     body.finish_view()
 }
@@ -251,7 +260,7 @@ fn network_nodes(state: &PageState) -> View {
     let expanded = state.expanded_details == Some(Section::Nodes);
     let caption = if expanded { "收起" } else { "查看" };
     let count = format!("{} 个节点", state.snapshot.peers.len());
-    let mut body = page_body().gap(4).child(section_header(
+    let mut body = panel().gap(6).child(section_header(
         "network",
         "玩家与节点",
         &count,
@@ -265,6 +274,14 @@ fn network_nodes(state: &PageState) -> View {
 
 pub(super) fn page_body() -> Container {
     View::column().full_width().gap(12).padding(0)
+}
+
+fn panel() -> Container {
+    page_body()
+        .gap(10)
+        .padding(12)
+        .corner_radius(8)
+        .background(ThemeToken::Surface)
 }
 
 fn section_header(icon: &str, title: &str, meta: &str, action: View) -> View {
@@ -378,25 +395,18 @@ mod tests {
     }
 
     fn assert_lobby_sections(page: &ViewTree) {
-        assert_plain_layout(page);
         let ViewNode::Container(root) = &page.nodes[page.root as usize] else {
             panic!("missing lobby layout");
         };
         assert_eq!(root.style.direction, LayoutDirection::Column);
-        assert_eq!(root.children.len(), 7);
-        assert!(
-            root.children
-                .iter()
-                .skip(1)
-                .step_by(2)
-                .all(|&index| { matches!(page.nodes[index as usize], ViewNode::Separator) })
-        );
-        assert!(
-            !page
-                .nodes
-                .iter()
-                .any(|node| matches!(node, ViewNode::Badge(_)))
-        );
+        assert_eq!(root.style.background, None);
+        assert_eq!(root.children.len(), 3);
+        for &child in &root.children {
+            assert!(matches!(
+                &page.nodes[child as usize],
+                ViewNode::Container(panel) if panel.style.background == Some(ThemeToken::Surface)
+            ));
+        }
     }
 
     fn configured() -> PageState {
@@ -413,7 +423,6 @@ mod tests {
     fn unavailable_component_exposes_install_as_the_only_action() {
         if option_env!("PAPERCONNECT_NATIVE_SHA256").is_none() {
             let setup = render(&PageState::default());
-            assert_plain_layout(&setup);
             assert_eq!(actions(&setup), ["install"]);
             assert!(
                 !setup
@@ -427,12 +436,11 @@ mod tests {
             ..configured()
         };
         let repair = render(&state);
-        assert_plain_layout(&repair);
         assert_eq!(actions(&repair), ["install"]);
     }
 
     #[test]
-    fn lobby_renders_actions_and_details_in_the_host_panel() {
+    fn lobby_renders_actions_and_details_in_separate_cards() {
         let mut state = configured();
         let lobby = render(&state);
         assert_lobby_sections(&lobby);
@@ -481,5 +489,24 @@ mod tests {
             actions(&connected),
             ["copy", "retry", "stop", "diagnostics", "nodes", "refresh"]
         );
+    }
+
+    #[test]
+    fn room_error_is_visible_in_the_first_card_next_to_the_retry_action() {
+        let mut state = configured();
+        state.problem = Some("创建房间失败：未检测到本机局域网世界".into());
+        let page = render(&state);
+        let ViewNode::Container(root) = &page.nodes[page.root as usize] else {
+            panic!("missing lobby layout");
+        };
+        let ViewNode::Container(room) = &page.nodes[root.children[0] as usize] else {
+            panic!("missing room card");
+        };
+        assert!(matches!(
+            &page.nodes[room.children[1] as usize],
+            ViewNode::Text(text) if text.style.color == Some(ThemeToken::Danger)
+                && state.problem.as_deref() == Some(text.text.as_str())
+        ));
+        assert_eq!(actions(&page)[0], "host");
     }
 }
