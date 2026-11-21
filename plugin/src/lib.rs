@@ -6,11 +6,15 @@ use bmcbl_plugin_api::native::{self, InstanceHandle, ModuleHandle, RequestId};
 use bmcbl_plugin_api::prelude::*;
 use paperconnect_protocol::{Batch, Command, Event, Preferences, Snapshot};
 
+mod details;
 mod page;
 mod room;
+mod settings;
 mod updates;
 
 use updates::Update;
+
+const PLUGIN: PluginMetadata = plugin_metadata!();
 
 struct PaperConnect;
 
@@ -30,8 +34,9 @@ struct PageState {
     message: String,
     activity: VecDeque<String>,
     room_code: String,
-    advanced: bool,
-    port_input: Option<String>,
+    settings: settings::Settings,
+    expanded_details: Option<details::Section>,
+    component_load_failed: bool,
     sequence: u64,
 }
 
@@ -49,6 +54,11 @@ thread_local! {
 }
 
 impl PageState {
+    fn component_available(&self) -> bool {
+        matches!(self.connection, Connection::Ready(_))
+            || (!self.component_load_failed && self.config.module_digest().is_some())
+    }
+
     fn command_pending(&self) -> bool {
         self.pending.is_some() || self.submit.is_some() || self.request.is_some()
     }
@@ -93,7 +103,16 @@ impl PageState {
         self.connection = match connection {
             Connection::Loading(job) if job.is_ready(event) => {
                 changed = true;
-                let module = ready(job)?;
+                let module = match ready(job) {
+                    Ok(module) => module,
+                    Err(error) => {
+                        self.component_load_failed = matches!(
+                            error.code.as_str(),
+                            "app" | "denied" | "invalid-input" | "not-found"
+                        );
+                        return Err(error);
+                    }
+                };
                 Connection::Creating(module, native::create_instance(module, &[])?)
             }
             Connection::Creating(module, job) if job.is_ready(event) => {
@@ -223,30 +242,6 @@ impl PageState {
         self.activity.push_back(message.into());
     }
 
-    fn save_preferences(&mut self) -> PluginResult<()> {
-        let raw = self.port_input.as_deref().unwrap_or_default().trim();
-        let port = if raw.is_empty() || raw == "0" {
-            0
-        } else {
-            raw.parse::<u16>()
-                .ok()
-                .filter(|port| *port >= 1025)
-                .ok_or_else(|| plugin_error("game-port", "端口应为 1025–65535，留空时自动探测。"))?
-        };
-        let mut document = read_config()?
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|error| plugin_error("config", error.to_string()))?;
-        document["player_name"] = toml_edit::value(self.config.player_name.trim());
-        document["game_port"] = toml_edit::value(i64::from(port));
-        document["bootstrap_peers"] = toml_edit::value(self.config.bootstrap_peers.trim());
-        document["disable_p2p"] = toml_edit::value(self.config.disable_p2p);
-        write_config(document.to_string())?;
-        self.config.game_port = port;
-        self.record_activity("联机选项已保存");
-        self.advanced = false;
-        Ok(())
-    }
-
     fn finish_command(&mut self, request: u64, message: String) {
         let id = RequestId(request);
         if request == 0 || self.request == Some(id) {
@@ -320,18 +315,28 @@ impl Plugin for PaperConnect {
         PAGE.with_borrow_mut(|state| state.config = config());
         Ok(registrations! {
             page "main", title = "创建或加入好友房间", tool = Tool::new("联机大厅").icon("users").order(100);
+            page settings::PAGE_ID, title = "联机设置";
             subscribe "config-changed";
         })
     }
 
     fn handle_event(event: PluginEvent) -> PluginResult<()> {
+        if event.page_id.as_deref() == Some(settings::PAGE_ID)
+            && let PluginEventKind::Action(action) = &event.kind
+        {
+            PAGE.with_borrow_mut(|state| state.settings.handle_action(action, &mut state.config));
+            return Ok(());
+        }
         let changed = PAGE.with_borrow_mut(|state| {
             let result = if event
                 .global_event()
                 .is_some_and(|(name, _)| name == "config-changed")
             {
-                state.config = config();
-                state.port_input = None;
+                let config = config();
+                if state.config.module_digest() != config.module_digest() {
+                    state.component_load_failed = false;
+                }
+                state.config = config;
                 Ok(true)
             } else if let PluginEventKind::Action(action) = &event.kind {
                 match action.action_id.as_str() {
@@ -372,39 +377,27 @@ impl Plugin for PaperConnect {
                         }
                     }
                     "copy" => match &state.snapshot.room {
-                        Some(room) => bmcbl_plugin_api::write_clipboard_text(&room.code),
+                        Some(room) => bmcbl_plugin_api::write_clipboard_text(&room.code)
+                            .map(|()| state.message = "联机码已复制。".into()),
                         None => Ok(()),
                     },
                     "stop" => state.start(Command::Stop),
                     "retry" => state.start(Command::RetryTransport),
                     "refresh" => state.start(Command::Snapshot),
-                    "advanced" => {
-                        state.advanced = !state.advanced;
-                        if state.advanced
-                            && state.port_input.is_none()
-                            && state.config.game_port != 0
-                        {
-                            state.port_input = Some(state.config.game_port.to_string());
-                        }
+                    "settings" => {
+                        state.settings = settings::Settings::from(&state.config);
+                        open_dialog(settings::PAGE_ID, "联机设置", 500, 490)
+                    }
+                    "diagnostics" | "nodes" => {
+                        let section = if action.action_id == "diagnostics" {
+                            details::Section::Diagnostics
+                        } else {
+                            details::Section::Nodes
+                        };
+                        state.expanded_details =
+                            (state.expanded_details != Some(section)).then_some(section);
                         Ok(())
                     }
-                    "player-name" => {
-                        state.config.player_name = action.value.clone().unwrap_or_default();
-                        return false;
-                    }
-                    "bootstrap-peers" => {
-                        state.config.bootstrap_peers = action.value.clone().unwrap_or_default();
-                        return false;
-                    }
-                    "game-port" => {
-                        state.port_input = action.value.clone();
-                        return false;
-                    }
-                    "disable-p2p" => {
-                        state.config.disable_p2p = action.value.as_deref() == Some("true");
-                        Ok(())
-                    }
-                    "save" => state.save_preferences(),
                     "cancel" => match (&state.connection, state.request) {
                         (Connection::Ready(instance), Some(request))
                             if state.cancel_job.is_none() =>
@@ -444,7 +437,19 @@ impl Plugin for PaperConnect {
         Ok(())
     }
 
-    fn render_page(_request: PageRenderRequest) -> PluginResult<ViewTree> {
-        Ok(PAGE.with_borrow(page::render))
+    fn render_page(request: PageRenderRequest) -> PluginResult<ViewTree> {
+        Ok(PAGE.with_borrow(|state| match request.page_id.as_str() {
+            settings::PAGE_ID => state.settings.render(&state.config),
+            _ => page::render(state),
+        }))
     }
+}
+
+fn open_dialog(page: &str, title: &str, width: u32, height: u32) -> PluginResult<()> {
+    invalidate_page(page)?;
+    PLUGIN
+        .modal(page)
+        .title(title)
+        .size(width, height)
+        .open(PLUGIN)
 }
