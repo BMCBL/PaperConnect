@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "paperconnect"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bmcbl_plugin_api",
  "getrandom 0.4.3",
