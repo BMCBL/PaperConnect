@@ -60,6 +60,7 @@ struct Release {
 struct Asset {
     name: String,
     digest: Option<String>,
+    size: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -124,16 +125,17 @@ impl PageState {
         match std::mem::take(&mut self.update) {
             Update::Platform { install, job } if job.is_ready(event) => {
                 let platform = ready(job)?;
-                let (registry, job) = match fetch_download_text(REGISTRY_DETAIL) {
-                    Ok(job) => (true, job),
-                    Err(_) => (false, fetch_download_text(RELEASE_INDEX)?),
-                };
-                self.update = Update::Release {
-                    install,
-                    platform,
-                    registry,
-                    job,
-                };
+                match fetch_download_text(REGISTRY_DETAIL) {
+                    Ok(job) => {
+                        self.update = Update::Release {
+                            install,
+                            platform,
+                            registry: true,
+                            job,
+                        }
+                    }
+                    Err(error) => self.fallback_release(install, platform, &error.message)?,
+                }
             }
             Update::Release {
                 install,
@@ -149,34 +151,23 @@ impl PageState {
                         {
                             component
                         }
-                        _ => {
-                            self.update = Update::Release {
+                        Ok(_) => {
+                            self.fallback_release(
                                 install,
                                 platform,
-                                registry: false,
-                                job: fetch_download_text(RELEASE_INDEX)?,
-                            };
+                                "registry release predates the plugin",
+                            )?;
+                            return Ok(true);
+                        }
+                        Err(error) => {
+                            self.fallback_release(install, platform, &error.message)?;
                             return Ok(true);
                         }
                     }
                 } else {
-                    component_for_platform(&ready(job)?, &platform)?
+                    component_for_platform(&ready(job).map_err(index_unavailable)?, &platform)?
                 };
-                let installed_version = self
-                    .config
-                    .native_version
-                    .as_deref()
-                    .and_then(|version| Version::parse(version).ok());
-                if self.config.module_digest() == Some(component.sha256.as_str())
-                    || installed_version.is_some_and(|version| version > component.version)
-                {
-                    self.message = "已安装最新原生组件。".into();
-                } else if install {
-                    self.download_component(component)?;
-                } else {
-                    self.message.clear();
-                    self.update = Update::Available(component);
-                }
+                self.apply_release(install, component)?;
             }
             Update::Starting { component, job } if job.is_ready(event) => {
                 let task_id = ready(job)?;
@@ -187,6 +178,7 @@ impl PageState {
                 save_component(&component)?;
                 self.config.native_version = Some(component.version.to_string());
                 self.config.native_sha256 = Some(component.sha256);
+                self.component_load_failed = false;
                 self.message = if matches!(self.connection, Connection::Ready(_)) {
                     "新版原生组件已安装，重载插件后生效。".into()
                 } else {
@@ -199,6 +191,52 @@ impl PageState {
             }
         }
         Ok(true)
+    }
+
+    fn fallback_release(
+        &mut self,
+        install: bool,
+        platform: Platform,
+        reason: &str,
+    ) -> PluginResult<()> {
+        log(
+            LogLevel::Warn,
+            format!("PaperConnect registry lookup failed: {reason}"),
+        );
+        if install
+            && !self.component_available()
+            && let Some(component) = option_env!("PAPERCONNECT_NATIVE_INDEX")
+                .and_then(|index| bundled_component(index, &platform))
+        {
+            return self.apply_release(true, component);
+        }
+        self.update = Update::Release {
+            install,
+            platform,
+            registry: false,
+            job: fetch_download_text(RELEASE_INDEX).map_err(index_unavailable)?,
+        };
+        Ok(())
+    }
+
+    fn apply_release(&mut self, install: bool, component: Component) -> PluginResult<()> {
+        let installed_version = self
+            .config
+            .native_version
+            .as_deref()
+            .and_then(|version| Version::parse(version).ok());
+        if self.component_available()
+            && (self.config.module_digest() == Some(component.sha256.as_str())
+                || installed_version.is_some_and(|version| version > component.version))
+        {
+            self.message = "已安装最新原生组件。".into();
+        } else if install {
+            self.download_component(component)?;
+        } else {
+            self.message.clear();
+            self.update = Update::Available(component);
+        }
+        Ok(())
     }
 
     fn download_component(&mut self, component: Component) -> PluginResult<()> {
@@ -231,6 +269,26 @@ impl PageState {
             component.version
         );
     }
+}
+
+fn index_unavailable(error: PluginError) -> PluginError {
+    log(
+        LogLevel::Warn,
+        format!(
+            "PaperConnect release index lookup failed: {}",
+            error.message
+        ),
+    );
+    plugin_error(
+        "native-release",
+        "暂时无法读取原生组件版本，请检查 BMCBL 的网络或代理设置后重试。",
+    )
+}
+
+fn bundled_component(index: &str, platform: &Platform) -> Option<Component> {
+    let component = component_for_platform(index, platform).ok()?;
+    let version = Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
+    (component.version == version && component.verified.is_some()).then_some(component)
 }
 
 fn component_for_platform(text: &str, platform: &Platform) -> PluginResult<Component> {
@@ -272,25 +330,39 @@ fn component_for_platform(text: &str, platform: &Platform) -> PluginResult<Compo
         platform.arch,
         platform.environment
     );
-    let sha256 = release
+    let missing = || {
+        plugin_error(
+            "native-asset",
+            format!("发布 {version} 尚无已校验的 {name}。"),
+        )
+    };
+    let asset = release
         .assets
         .into_iter()
         .find(|asset| asset.name == name)
-        .and_then(|asset| asset.digest)
-        .and_then(|digest| digest.strip_prefix("sha256:").map(str::to_owned))
+        .ok_or_else(missing)?;
+    let sha256 = asset
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
         .filter(|sha| valid_digest(sha))
-        .ok_or_else(|| {
-            plugin_error(
-                "native-asset",
-                format!("发布 {version} 尚无已校验的 {name}。"),
-            )
-        })?;
+        .ok_or_else(missing)?
+        .to_owned();
     let url = format!("{RELEASE_DOWNLOAD}/v{version}/{name}");
+    let verified = asset
+        .size
+        .filter(|size| (1..=256 * 1024 * 1024).contains(size))
+        .map(|size| VerifiedDownload {
+            urls: vec![url.clone()],
+            filename: name,
+            sha256: sha256.clone(),
+            size,
+        });
     Ok(Component {
         version,
         url,
         sha256,
-        verified: None,
+        verified,
     })
 }
 
@@ -382,43 +454,4 @@ fn save_component(component: &Component) -> PluginResult<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn release_asset_requires_the_exact_platform_abi_and_digest() {
-        let sha = "9".repeat(64);
-        let release = serde_json::json!({
-            "tag_name": "v0.1.0",
-            "assets": [
-                {"name":"paperconnect-native-abi1-windows-x86_64-msvc.dll","digest":format!("sha256:{sha}")},
-                {"name":"paperconnect-native-abi1-linux-aarch64-gnu.so","digest":format!("sha256:{sha}")},
-                {"name":"paperconnect-native-abi2-linux-x86_64-gnu.so","digest":format!("sha256:{sha}")},
-            ]
-        }).to_string();
-        for (os, arch, environment, extension) in [
-            ("windows", "x86_64", "msvc", "dll"),
-            ("linux", "aarch64", "gnu", "so"),
-        ] {
-            let platform = Platform {
-                os: os.into(),
-                arch: arch.into(),
-                environment: environment.into(),
-            };
-            let component = component_for_platform(&release, &platform).unwrap();
-            assert_eq!(component.version, Version::new(0, 1, 0));
-            assert_eq!(component.sha256, sha);
-            assert!(
-                component
-                    .url
-                    .ends_with(&format!("-abi1-{os}-{arch}-{environment}.{extension}"))
-            );
-        }
-        let platform = Platform {
-            os: "linux".into(),
-            arch: "x86_64".into(),
-            environment: "gnu".into(),
-        };
-        assert!(component_for_platform(&release, &platform).is_err());
-    }
-}
+mod tests;

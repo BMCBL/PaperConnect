@@ -66,20 +66,47 @@ jobs:
 
   plugin:
     name: Wasm plugin
+    needs: native
     runs-on: ubuntu-22.04
     env:
       BMCBL_PLUGIN_SKIP_DEV_INSTALL: '1'
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native-assets
+          merge-multiple: true
       - name: Test and package plugin
         run: |
           rustup target add wasm32-wasip2
+          mkdir -p artifacts
+          (cd native-assets && sha256sum --check --strict *.sha256)
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1']))
+          version = next(package['version'] for package in metadata['packages'] if package['name'] == 'paperconnect')
+          directory = Path('native-assets')
+          assets = []
+          for checksum in sorted(directory.glob('paperconnect-native-*.sha256')):
+              digest, name = checksum.read_text(encoding='ascii').split()
+              assets.append({'name': name, 'digest': f'sha256:{digest}', 'size': (directory / name).stat().st_size})
+          assert len(assets) == 4, 'all native targets must provide a digest'
+          index = {'tag_name': f'v{version}', 'assets': assets}
+          Path('artifacts/paperconnect-native.json').write_text(json.dumps(index, indent=2) + '\n', encoding='utf-8')
+          PY
+          export PAPERCONNECT_NATIVE_INDEX="$(cat artifacts/paperconnect-native.json)"
           cargo test --locked -p paperconnect --lib
           BMCBL_PLUGIN_PACKAGE_OUT_DIR="$PWD/artifacts" cargo build --locked --release --target wasm32-wasip2 -p paperconnect
       - uses: actions/upload-artifact@v4
         with:
           name: paperconnect-plugin
-          path: artifacts/*.bmcblx
+          path: |
+            artifacts/*.bmcblx
+            artifacts/paperconnect-native.json
           if-no-files-found: error
 
   release:
@@ -111,18 +138,5 @@ jobs:
             options=(--target "$GITHUB_SHA")
           fi
           (cd artifacts && sha256sum --check --strict *.sha256)
-          python3 - "$tag" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          directory = Path('artifacts')
-          assets = []
-          for checksum in sorted(directory.glob('paperconnect-native-*.sha256')):
-              digest, name = checksum.read_text(encoding='ascii').split()
-              assets.append({'name': name, 'digest': f'sha256:{digest}'})
-          assert len(assets) == 4, 'all native targets must provide a digest'
-          index = {'tag_name': sys.argv[1], 'assets': assets}
-          (directory / 'paperconnect-native.json').write_text(json.dumps(index, indent=2) + '\n', encoding='utf-8')
-          PY
+          [[ "$(jq -er '.tag_name' artifacts/paperconnect-native.json)" == "$tag" ]]
           gh release create "$tag" artifacts/* --repo "$GITHUB_REPOSITORY" "${options[@]}" --generate-notes --latest
