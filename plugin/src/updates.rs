@@ -1,5 +1,5 @@
 use bmcbl_plugin_api::app::{Job, VerifiedDownload, download_verified, fetch_download_text};
-use bmcbl_plugin_api::native::{self, Platform};
+use bmcbl_plugin_api::native::{self, ModuleHandle, Platform};
 use bmcbl_plugin_api::prelude::*;
 use semver::Version;
 use serde::Deserialize;
@@ -16,12 +16,16 @@ const REGISTRY_DETAIL: &str = "https://bmcbl-plugin.chlna6666.com/v1/plugins/pap
 pub(super) enum Update {
     #[default]
     Idle,
+    Local {
+        digest: String,
+        job: Job<ModuleHandle>,
+    },
     Platform {
-        install: bool,
+        mode: CheckMode,
         job: Job<Platform>,
     },
     Release {
-        install: bool,
+        mode: CheckMode,
         platform: Platform,
         registry: bool,
         job: Job<String>,
@@ -35,6 +39,13 @@ pub(super) enum Update {
         component: Component,
         job: Job<()>,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CheckMode {
+    Startup,
+    Manual,
+    Install,
 }
 
 pub(super) struct Component {
@@ -99,20 +110,37 @@ enum RegistrySource {
 }
 
 impl PageState {
-    pub(super) fn check_native_update(&mut self, install: bool) -> PluginResult<()> {
+    pub(super) fn check_native_on_startup(&mut self) {
+        if let Some(digest) = self.config.module_digest().map(str::to_owned) {
+            match native::load(&digest) {
+                Ok(job) => {
+                    self.update = Update::Local { digest, job };
+                    return;
+                }
+                Err(error) => self.report_local_component(&error),
+            }
+        }
+        if let Err(error) = self.check_native_update(CheckMode::Startup) {
+            self.report_update_failure(error);
+        }
+    }
+
+    pub(super) fn check_native_update(&mut self, mode: CheckMode) -> PluginResult<()> {
         if matches!(self.update, Update::Idle) {
             self.update = Update::Platform {
-                install,
+                mode,
                 job: native::platform()?,
             };
-            self.message = "正在检查原生组件版本…".into();
+            if mode != CheckMode::Startup || !self.component_available() {
+                self.message = "正在检查原生组件版本…".into();
+            }
         }
         Ok(())
     }
 
     pub(super) fn install_native(&mut self) -> PluginResult<()> {
         match std::mem::take(&mut self.update) {
-            Update::Idle => self.check_native_update(true),
+            Update::Idle => self.check_native_update(CheckMode::Install),
             Update::Available(component) => self.download_component(component),
             current => {
                 self.update = current;
@@ -121,24 +149,73 @@ impl PageState {
         }
     }
 
-    pub(super) fn advance_update(&mut self, event: &PluginEvent) -> PluginResult<bool> {
+    pub(super) fn advance_update(&mut self, event: &PluginEvent) -> bool {
+        let startup = match &self.update {
+            Update::Local { .. } => true,
+            Update::Platform { mode, .. } | Update::Release { mode, .. } => {
+                *mode == CheckMode::Startup
+            }
+            _ => false,
+        };
+        match self.advance_update_job(event) {
+            Ok(changed) => changed,
+            Err(error) => {
+                if startup && self.component_available() {
+                    log_warn!("PaperConnect 后台检查原生组件失败：{}", error.message);
+                } else {
+                    self.report_update_failure(error);
+                }
+                true
+            }
+        }
+    }
+
+    fn report_update_failure(&mut self, error: PluginError) {
+        self.message.clear();
+        self.report_problem(error.message);
+    }
+
+    fn report_local_component(&mut self, error: &PluginError) {
+        if matches!(self.connection, Connection::Ready(_)) || self.command_pending() {
+            log_warn!("PaperConnect 原生组件预检失败：{}", error.message);
+            return;
+        }
+        self.component_load_failed |= is_component_load_error(error);
+        if self.component_load_failed {
+            self.report_problem(format!("原生组件无法加载：{}", error.message));
+        } else {
+            log_warn!("PaperConnect 原生组件预检失败：{}", error.message);
+        }
+    }
+
+    fn advance_update_job(&mut self, event: &PluginEvent) -> PluginResult<bool> {
         match std::mem::take(&mut self.update) {
-            Update::Platform { install, job } if job.is_ready(event) => {
+            Update::Local { digest, job } if job.is_ready(event) => {
+                let result = ready(job);
+                if self.config.module_digest() == Some(digest.as_str()) {
+                    match result {
+                        Ok(_) => log_info("PaperConnect 原生组件已通过本地校验"),
+                        Err(error) => self.report_local_component(&error),
+                    }
+                }
+                self.check_native_update(CheckMode::Startup)?;
+            }
+            Update::Platform { mode, job } if job.is_ready(event) => {
                 let platform = ready(job)?;
                 match fetch_download_text(REGISTRY_DETAIL) {
                     Ok(job) => {
                         self.update = Update::Release {
-                            install,
+                            mode,
                             platform,
                             registry: true,
                             job,
                         }
                     }
-                    Err(error) => self.fallback_release(install, platform, &error.message)?,
+                    Err(error) => self.fallback_release(mode, platform, &error.message)?,
                 }
             }
             Update::Release {
-                install,
+                mode,
                 platform,
                 registry,
                 job,
@@ -153,21 +230,21 @@ impl PageState {
                         }
                         Ok(_) => {
                             self.fallback_release(
-                                install,
+                                mode,
                                 platform,
                                 "registry release predates the plugin",
                             )?;
                             return Ok(true);
                         }
                         Err(error) => {
-                            self.fallback_release(install, platform, &error.message)?;
+                            self.fallback_release(mode, platform, &error.message)?;
                             return Ok(true);
                         }
                     }
                 } else {
-                    component_for_platform(&ready(job).map_err(index_unavailable)?, &platform)?
+                    release_component(ready(job), &platform)?
                 };
-                self.apply_release(install, component)?;
+                self.apply_release(mode, component)?;
             }
             Update::Starting { component, job } if job.is_ready(event) => {
                 let task_id = ready(job)?;
@@ -195,7 +272,7 @@ impl PageState {
 
     fn fallback_release(
         &mut self,
-        install: bool,
+        mode: CheckMode,
         platform: Platform,
         reason: &str,
     ) -> PluginResult<()> {
@@ -203,23 +280,29 @@ impl PageState {
             LogLevel::Warn,
             format!("PaperConnect registry lookup failed: {reason}"),
         );
-        if install
+        if mode == CheckMode::Install
             && !self.component_available()
             && let Some(component) = option_env!("PAPERCONNECT_NATIVE_INDEX")
                 .and_then(|index| bundled_component(index, &platform))
         {
-            return self.apply_release(true, component);
+            return self.apply_release(mode, component);
         }
+        let job = match fetch_download_text(RELEASE_INDEX) {
+            Ok(job) => job,
+            Err(error) => {
+                return self.apply_release(mode, release_component(Err(error), &platform)?);
+            }
+        };
         self.update = Update::Release {
-            install,
+            mode,
             platform,
             registry: false,
-            job: fetch_download_text(RELEASE_INDEX).map_err(index_unavailable)?,
+            job,
         };
         Ok(())
     }
 
-    fn apply_release(&mut self, install: bool, component: Component) -> PluginResult<()> {
+    fn apply_release(&mut self, mode: CheckMode, component: Component) -> PluginResult<()> {
         let installed_version = self
             .config
             .native_version
@@ -229,11 +312,16 @@ impl PageState {
             && (self.config.module_digest() == Some(component.sha256.as_str())
                 || installed_version.is_some_and(|version| version > component.version))
         {
-            self.message = "已安装最新原生组件。".into();
-        } else if install {
+            if mode != CheckMode::Startup {
+                self.message = "已安装最新原生组件。".into();
+            }
+        } else if mode == CheckMode::Install {
             self.download_component(component)?;
         } else {
-            self.message.clear();
+            if !self.command_pending() {
+                self.message.clear();
+            }
+            log_info!("PaperConnect 原生组件 v{} 可安装", component.version);
             self.update = Update::Available(component);
         }
         Ok(())
@@ -268,6 +356,31 @@ impl PageState {
             "正在下载原生组件 {}，校验完成后将请求授权。",
             component.version
         );
+    }
+}
+
+pub(super) fn is_component_load_error(error: &PluginError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "app" | "denied" | "invalid-input" | "not-found"
+    )
+}
+
+fn release_component(
+    release: PluginResult<String>,
+    platform: &Platform,
+) -> PluginResult<Component> {
+    let bundled = option_env!("PAPERCONNECT_NATIVE_INDEX")
+        .and_then(|index| bundled_component(index, platform));
+    match release
+        .map_err(index_unavailable)
+        .and_then(|text| component_for_platform(&text, platform))
+    {
+        Ok(remote) => Ok(match bundled {
+            Some(component) if component.version > remote.version => component,
+            _ => remote,
+        }),
+        Err(error) => bundled.ok_or(error),
     }
 }
 

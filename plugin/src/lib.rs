@@ -12,7 +12,7 @@ mod room;
 mod settings;
 mod updates;
 
-use updates::Update;
+use updates::{CheckMode, Update, is_component_load_error};
 
 const PLUGIN: PluginMetadata = plugin_metadata!();
 
@@ -111,7 +111,7 @@ impl PageState {
     }
 
     fn complete(&mut self, event: &PluginEvent) -> PluginResult<bool> {
-        let mut changed = self.advance_update(event)?;
+        let mut changed = self.advance_update(event);
         let connection = std::mem::take(&mut self.connection);
         self.connection = match connection {
             Connection::Loading(job) if job.is_ready(event) => {
@@ -119,10 +119,7 @@ impl PageState {
                 let module = match ready(job) {
                     Ok(module) => module,
                     Err(error) => {
-                        self.component_load_failed = matches!(
-                            error.code.as_str(),
-                            "app" | "denied" | "invalid-input" | "not-found"
-                        );
+                        self.component_load_failed = is_component_load_error(&error);
                         return Err(stage_error("加载原生组件", error));
                     }
                 };
@@ -372,8 +369,10 @@ impl Config {
 #[bmcbl_plugin]
 impl Plugin for PaperConnect {
     fn init(_context: PluginContext) -> PluginResult<Vec<Registration>> {
-        PAGE.with_borrow_mut(|state| state.config = config());
-        log_info!("PaperConnect v{} 联机大厅已注册", env!("CARGO_PKG_VERSION"));
+        PAGE.with_borrow_mut(|state| {
+            state.config = config();
+            state.check_native_on_startup();
+        });
         Ok(registrations! {
             page "main", title = "创建或加入好友房间", tool = Tool::new("联机大厅").icon("users").order(100);
             page settings::PAGE_ID, title = "联机设置";
@@ -486,7 +485,7 @@ impl Plugin for PaperConnect {
                         state.install_native()
                     }
                     "check-update" if !state.command_pending() && state.snapshot.room.is_none() => {
-                        state.check_native_update(false)
+                        state.check_native_update(CheckMode::Manual)
                     }
                     _ => return false,
                 }
