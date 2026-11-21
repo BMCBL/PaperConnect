@@ -1,6 +1,6 @@
 [package]
 name = "paperconnect"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 license = "GPL-3.0"
 publish = false
@@ -32,6 +32,7 @@ bmcbl_plugin_api = { path = "sdk/bmcbl-plugin-api", features = ["pack"] }
 id = "paperconnect"
 name = "PaperConnect"
 description = "Bedrock multiplayer and local UDP diagnostics"
+tags = ["multiplayer", "networking", "p2p", "bedrock"]
 capabilities = ["ui.page", "clipboard.read", "clipboard.write", "config.read", "config.write", "event.global", "network.http", "download.start"]
 readme = "README.md"
 icon = "assets/icon.png"
