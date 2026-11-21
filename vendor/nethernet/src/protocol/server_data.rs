@@ -1,7 +1,6 @@
 //! `ServerData`：局域网世界卡片的应用层数据。
 //!
-//! 线格式与 go-nethernet `discovery/server_data.go` 逐字节一致（v5），
-//! 并兼容旧版 v4 载荷。
+//! 读取 Bedrock v4 至 v7 的发现数据。
 
 use crate::error::{NethernetError, Result};
 use crate::protocol::codec::{Rd, put_var_bytes, put_var_i32};
@@ -120,7 +119,7 @@ impl ServerData {
         Ok(buf.freeze())
     }
 
-    /// 解析 v5 或旧版 v4 载荷。
+    /// 解析 v4 至 v7 载荷。
     ///
     /// # Errors
     ///
@@ -128,7 +127,8 @@ impl ServerData {
     pub fn decode(data: Bytes) -> Result<Self> {
         let mut rd = Rd::new(data);
         match rd.u8()? {
-            5 => Self::decode_v5(&mut rd),
+            7 => Self::decode_v7(&mut rd),
+            version @ (5 | 6) => Self::decode_v5_v6(&mut rd, version),
             4 => Self::decode_v4(&mut rd),
             version => Err(NethernetError::protocol(format!(
                 "不支持的 ServerData 版本：{version}"
@@ -136,7 +136,41 @@ impl ServerData {
         }
     }
 
-    fn decode_v5(rd: &mut Rd) -> Result<Self> {
+    fn decode_v7(rd: &mut Rd) -> Result<Self> {
+        let server_name = rd.var_string()?;
+        // v7 carries the Bedrock protocol and game version before the level name.
+        // Discovery uses the returned address and network ID to open the transport.
+        let _protocol = rd.var_i32()?;
+        let _game_version = rd.var_string()?;
+        let level_name = rd.var_string()?;
+        let player_count = rd.var_i32()?;
+        let max_player_count = rd.var_i32()?;
+        let game_type = rd.var_i32()?;
+        let editor_world = rd.bool()?;
+        let hardcore = rd.bool()?;
+        let accepts_online_auth = rd.bool()?;
+        let accepts_self_signed_auth = rd.bool()?;
+        let _nonce = rd.var_string()?;
+        let connection_type = rd.var_i32()?;
+        if !rd.is_empty() {
+            return Err(NethernetError::protocol("ServerData v7 含有尾随数据"));
+        }
+        Ok(Self {
+            server_name,
+            level_name,
+            game_type,
+            player_count,
+            max_player_count,
+            editor_world,
+            hardcore,
+            accepts_online_auth,
+            accepts_self_signed_auth,
+            transport_layer: transport_layer::NETHERNET,
+            connection_type,
+        })
+    }
+
+    fn decode_v5_v6(rd: &mut Rd, version: u8) -> Result<Self> {
         let data = Self {
             server_name: rd.var_string()?,
             level_name: rd.var_string()?,
@@ -147,7 +181,13 @@ impl ServerData {
             hardcore: rd.bool()?,
             accepts_online_auth: rd.bool()?,
             accepts_self_signed_auth: rd.bool()?,
-            transport_layer: rd.var_i32()?,
+            transport_layer: {
+                // v6 inserts a login nonce before the legacy transport fields.
+                if version == 6 {
+                    let _nonce = rd.var_string()?;
+                }
+                rd.var_i32()?
+            },
             connection_type: rd.var_i32()?,
         };
         if !rd.is_empty() {
@@ -317,6 +357,36 @@ mod tests {
         assert_eq!(decoded.transport_layer, 2);
         assert_eq!(decoded.connection_type, 4);
         assert!(decoded.accepts_online_auth);
+    }
+
+    #[test]
+    fn reads_v6_discovery_with_fixed_width_counts_and_nonce() {
+        let payload = Bytes::from_static(
+            b"\x06\x04Host\x05World\x02\x03\0\0\0\x14\0\0\0\0\x01\x01\0\x04a1b2\x04\x08",
+        );
+        let world = ServerData::decode(payload.clone()).unwrap();
+        assert_eq!(world.server_name, "Host");
+        assert_eq!(world.level_name, "World");
+        assert_eq!((world.player_count, world.max_player_count), (3, 20));
+        assert_eq!(world.game_type, game_type::CREATIVE);
+        assert!(!world.accepts_self_signed_auth);
+        assert_eq!(world.transport_layer, transport_layer::NETHERNET);
+        assert_eq!(world.connection_type, 4);
+        assert!(ServerData::decode(payload.slice(..25)).is_err());
+    }
+
+    #[test]
+    fn reads_v7_discovery_with_varint_counts_and_nonce() {
+        let payload = Bytes::from_static(
+            b"\x07\x04Host\xaa\x0f\x0526.60\x05World\x06\x28\x02\0\0\x01\x01\x04a1b2\x08",
+        );
+        let world = ServerData::decode(payload.clone()).unwrap();
+        assert_eq!(world.server_name, "Host");
+        assert_eq!(world.level_name, "World");
+        assert_eq!((world.player_count, world.max_player_count), (3, 20));
+        assert_eq!(world.game_type, game_type::CREATIVE);
+        assert_eq!(world.connection_type, 4);
+        assert!(ServerData::decode(payload.slice(..payload.len() - 1)).is_err());
     }
 
     #[test]
